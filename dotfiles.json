@@ -1,0 +1,10 @@
+{
+  "dotfiles": [
+    {
+      "source": "ly",
+      "target": "/etc/ly/",
+      "pre_copy": [],
+      "post_copy": []
+    }
+  ]
+}
