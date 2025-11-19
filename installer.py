@@ -38,20 +38,20 @@ if os.geteuid() == 0:
     logger.error("Please make a new user and run this script as that user, not as root.")
     sys.exit(1)
 
-run("pacman -Syu --noconfirm")
-run("""pacman -S --needed git base-devel jq --noconfirm""")
+run("""sudo pacman -Syu --noconfirm""")
+run("""sudo pacman -S --needed git base-devel jq --noconfirm""")
 
 # Chaotic AUR
-run("""pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com""")
-run("""pacman-key --lsign-key 3056513887B78AEB""")
-run("""pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' --noconfirm""")
-run("""pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' --noconfirm""")
-run("""grep -q "\\[chaotic-aur\\]" /etc/pacman.conf || \\
+run("""sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com""")
+run("""sudo pacman-key --lsign-key 3056513887B78AEB""")
+run("""sudo pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' --noconfirm""")
+run("""sudo pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' --noconfirm""")
+run("""sudo grep -q "\\[chaotic-aur\\]" /etc/pacman.conf || \\
     echo -e "\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist" >> /etc/pacman.conf\"""")
-run("""pacman -Syu --noconfirm""")
+run("""sudo pacman -Syu --noconfirm""")
 
 # Install yay
-run(f"""sudo -u "{current_user}" bash <<'EOF'
+run(f"""bash <<'EOF'
 cd /tmp
 git clone https://aur.archlinux.org/yay.git
 cd yay
@@ -60,7 +60,7 @@ rm -rf /tmp/yay
 EOF""")
 
 # Main packages
-run(f"""sudo -u "{current_user}" yay -S --noconfirm --needed \
+run(f"""yay -S --noconfirm --needed \
     hyprland waybar alacritty fish \
     python-pywal wpgtk swww gradience kvantum kvantum-theme-materia \
     cliphist wl-clipboard mako grim slurp swappy \
