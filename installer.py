@@ -93,30 +93,21 @@ rm -rf /tmp/yay
 EOF""")
 
 # Main packages
-package_result = run(f"""yay -S --noconfirm --needed \
+run(f"""yay -S --noconfirm --needed \
     hyprland waybar alacritty fish \
     python-pywal wpgtk swww gradience kvantum kvantum-theme-materia \
     cliphist wl-clipboard mako grim slurp swappy \
     upower brightnessctl pavucontrol playerctl \
-    networkmanager nm-applet bluez bluez-utils blueman \
+    networkmanager bluez bluez-utils blueman \
     fastfetch git stow \
     noto-fonts noto-fonts-emoji ttf-font-awesome \
     polkit-kde-agent xdg-desktop-portal-hyprland \
     ly
 """)
 
-if package_result != 0:
-    logger.warning("Package installation completed with warnings, but continuing with dotfiles...")
-else:
-    logger.info("Package installation completed successfully")
-
 # Load JSON
 with open('dotfiles.json', 'r') as file:
     dotfiles_data = json.load(file)
-
-logger.info(f"Loaded {len(dotfiles_data)} dotfiles")
-logger.debug(f"Content: {dotfiles_data}")
-
 
 # Iterate through each entry
 for dotfile in dotfiles_data:
