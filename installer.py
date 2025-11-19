@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import json
+import subprocess
 
 class LogFormatter(logging.Formatter):
     RESET = '\033[0m'
@@ -30,7 +31,7 @@ h.setFormatter(LogFormatter(use_color=sys.stderr.isatty()))
 def run(*args, **kwargs):
     return os.system(*args, **kwargs)
 
-current_user = str(run("id -u -n")).strip()
+current_user = subprocess.check_output(["id", "-u", "-n"], text=True).strip()
 logger.info(f"Running as user: {current_user}")
 
 if os.geteuid() == 0:
