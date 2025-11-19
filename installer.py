@@ -93,7 +93,7 @@ rm -rf /tmp/yay
 EOF""")
 
 # Main packages
-run(f"""yay -S --noconfirm --needed \
+package_result = run(f"""yay -S --noconfirm --needed \
     hyprland waybar alacritty fish \
     python-pywal wpgtk swww gradience kvantum kvantum-theme-materia \
     cliphist wl-clipboard mako grim slurp swappy \
@@ -104,6 +104,11 @@ run(f"""yay -S --noconfirm --needed \
     polkit-kde-agent xdg-desktop-portal-hyprland \
     ly
 """)
+
+if package_result != 0:
+    logger.warning("Package installation completed with warnings, but continuing with dotfiles...")
+else:
+    logger.info("Package installation completed successfully")
 
 # Load JSON
 with open('dotfiles.json', 'r') as file:
