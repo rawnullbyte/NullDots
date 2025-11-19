@@ -112,7 +112,7 @@ packages += "noto-fonts noto-fonts-emoji ttf-font-awesome "
 packages += "polkit-kde-agent xdg-desktop-portal-hyprland ly"
 
 # Install all packages at once
-run(f"yay -S --noconfirm --needed {packages}")
+#run(f"yay -S --noconfirm --needed {packages}")
 
 # Load JSON
 with open('dotfiles.json', 'r') as file:
