@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import subprocess
+import threading
 
 class LogFormatter(logging.Formatter):
     RESET = '\033[0m'
@@ -28,9 +29,41 @@ h = logging.StreamHandler()
 h.setLevel(logging.DEBUG)
 h.setFormatter(LogFormatter(use_color=sys.stderr.isatty()))
 
-def run(*args, **kwargs):
-    return os.system(*args, **kwargs)
+def run(cmd, shell=True):
+    """
+    Runs a command in a subprocess with real-time output and interactive input.
+    Returns the subprocess return code.
+    """
+    logger.info(f"Running command: {cmd}")
 
+    # Start the subprocess
+    process = subprocess.Popen(
+        cmd,
+        shell=shell,
+        stdin=sys.stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    # Function to read output line by line
+    def stream_output(pipe):
+        for line in iter(pipe.readline, ''):
+            print(line, end='')  # already has newline
+        pipe.close()
+
+    # Start a thread to stream stdout
+    t = threading.Thread(target=stream_output, args=(process.stdout,))
+    t.start()
+
+    # Wait for process to finish
+    process.wait()
+    t.join()
+
+    logger.info(f"Command exited with code {process.returncode}")
+    return process.returncode
 current_user = subprocess.check_output(["id", "-u", "-n"], text=True).strip()
 logger.info(f"Running as user: {current_user}")
 
