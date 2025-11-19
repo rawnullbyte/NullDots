@@ -109,6 +109,10 @@ run(f"""yay -S --noconfirm --needed \
 with open('dotfiles.json', 'r') as file:
     dotfiles_data = json.load(file)
 
+logger.info(f"Loaded {len(dotfiles_data)} dotfiles")
+logger.debug(f"Content: {dotfiles_data}")
+
+
 # Iterate through each entry
 for dotfile in dotfiles_data:
     source = dotfile.get("source")
