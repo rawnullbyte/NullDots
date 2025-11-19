@@ -90,7 +90,7 @@ echo "======================================"
 copy_dotfiles() {
     local username=$1
     local dotfiles_dir="./dotfiles"
-    local config_file="$./dotfiles.json"
+    local config_file="./dotfiles.json"
     
     if [ ! -f "$config_file" ]; then
         echo "Error: dotfiles.json not found at $config_file"
