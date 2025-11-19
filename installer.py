@@ -90,18 +90,20 @@ for dotfile in dotfiles_data:
     logger.info("----------")
 
     if pre_copy:
-        r = run(pre_copy)
-        if r != 0:
-            logger.error(f"Pre-copy command failed: {pre_copy}")
+        for cmd in pre_copy:
+            r = run(cmd)
+            if r != 0:
+                logger.error(f"Pre-copy command failed: {pre_copy}")
 
-    r = run(f"cp -R {source} {target}")
+    r = run(f"cp -R \"{source}\" \"{target}\"")
     if r != 0:
         logger.error(f"Failed to copy {source} to {target}")
 
     if post_copy:
-        r = run(post_copy)
-        if r != 0:
-            logger.error(f"Post-copy command failed: {post_copy}")
+        for cmd in post_copy:
+            r = run(cmd)
+            if r != 0:
+                logger.error(f"Post-copy command failed: {post_copy}")
 
 # Enable ly
 run("sudo systemctl enable ly.service")
