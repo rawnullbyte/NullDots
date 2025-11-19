@@ -35,6 +35,7 @@ logger.info(f"Running as user: {current_user}")
 
 if os.geteuid() == 0:
     logger.error("Please make a new user and run this script as that user, not as root.")
+    sys.exit(1)
 
 run("pacman -Syu --noconfirm")
 run("""pacman -S --needed git base-devel jq --noconfirm""")
