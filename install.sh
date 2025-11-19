@@ -132,10 +132,10 @@ copy_dotfiles() {
         local source_path="$dotfiles_dir/$source"
         if [ -d "$source_path" ]; then
             echo "Copying directory: $source_path to $target"
-            cp -r "$source_path" "$target" 2>/dev/null || sudo -u $username cp -r "$source_path" "$target"
+            sudo cp -r "$source_path" "$target" 2>/dev/null || sudo -u $username cp -r "$source_path" "$target"
         elif [ -f "$source_path" ]; then
             echo "Copying file: $source_path to $target"
-            cp "$source_path" "$target" 2>/dev/null || sudo -u $username cp "$source_path" "$target"
+            sudo cp "$source_path" "$target" 2>/dev/null || sudo -u $username cp "$source_path" "$target"
         else
             echo "Warning: Source $source_path not found"
             continue
