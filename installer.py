@@ -93,17 +93,26 @@ rm -rf /tmp/yay
 EOF""")
 
 # Main packages
-run(f"""yay -S --noconfirm --needed \
-    hyprland waybar alacritty fish \
-    python-pywal wpgtk swww gradience kvantum kvantum-theme-materia \
-    cliphist wl-clipboard mako grim slurp swappy \
-    upower brightnessctl pavucontrol playerctl \
-    networkmanager bluez bluez-utils blueman \
-    fastfetch git stow \
-    noto-fonts noto-fonts-emoji ttf-font-awesome \
-    polkit-kde-agent xdg-desktop-portal-hyprland \
-    ly
-""")
+packages = ""
+# Hyprland + core apps
+packages += "hyprland waybar alacritty fish "
+# Themes / appearance
+packages += "python-pywal wpgtk swww gradience kvantum kvantum-theme-materia "
+# Wayland utilities / screenshot / clipboard / notification
+packages += "cliphist wl-clipboard mako grim slurp swappy "
+# Power / audio / media control
+packages += "upower brightnessctl pavucontrol playerctl "
+# Network / bluetooth
+packages += "networkmanager bluez bluez-utils blueman "
+# Utilities
+packages += "fastfetch git stow "
+# Fonts
+packages += "noto-fonts noto-fonts-emoji ttf-font-awesome "
+# Polkit / portal / display manager
+packages += "polkit-kde-agent xdg-desktop-portal-hyprland ly"
+
+# Install all packages at once
+run(f"yay -S --noconfirm --needed {packages}")
 
 # Load JSON
 with open('dotfiles.json', 'r') as file:
