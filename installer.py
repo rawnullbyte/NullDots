@@ -141,7 +141,7 @@ for dotfile in dotfiles_data:
             if r != 0:
                 logger.error(f"Pre-copy command failed: {pre_copy}")
 
-    r = run(f"cp -R \"{source}\" \"{target}\"")
+    r = run(f"cp -rfT \"{source}\" \"{target}\"")
     if r != 0:
         logger.error(f"Failed to copy {source} to {target}")
 
