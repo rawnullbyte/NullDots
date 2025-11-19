@@ -35,7 +35,7 @@ def run(cmd, shell=True):
     Runs a command in a subprocess with real-time output and interactive input.
     Returns the subprocess return code.
     """
-    return
+    
     logger.info(f"Running command: {cmd}")
 
     # Start the subprocess
