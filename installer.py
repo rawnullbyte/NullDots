@@ -28,6 +28,7 @@ logger.setLevel(logging.DEBUG)
 h = logging.StreamHandler()
 h.setLevel(logging.DEBUG)
 h.setFormatter(LogFormatter(use_color=sys.stderr.isatty()))
+logger.addHandler(h)
 
 def run(cmd, shell=True):
     """
