@@ -1,6 +1,6 @@
 [{
   "source": "./dotfiles/ly",
-  "target": "/etc/ly",
+  "target": "/etc/ly/",
   "pre_copy": [],
   "post_copy": []
 },
@@ -8,6 +8,30 @@
   "source": "./dotfiles/hypr",
   "target": "$HOME/.config/hypr/",
   "pre_copy": ["sudo rm -rf ~/.config/hypr/*"],
+  "post_copy": []
+},
+{
+  "source": "./dotfiles/kitty",
+  "target": "$HOME/.config/kitty/",
+  "pre_copy": [],
+  "post_copy": []
+},
+{
+  "source": "./dotfiles/tofi",
+  "target": "$HOME/.config/tofi/",
+  "pre_copy": [],
+  "post_copy": []
+},
+{
+  "source": "./dotfiles/waybar",
+  "target": "$HOME/.config/waybar/",
+  "pre_copy": [],
+  "post_copy": []
+},
+{
+  "source": "./dotfiles/wlogout",
+  "target": "$HOME/.config/wlogout/",
+  "pre_copy": [],
   "post_copy": []
 },
 {
