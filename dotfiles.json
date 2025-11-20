@@ -6,7 +6,7 @@
 },
 {
   "source": "./dotfiles/hypr",
-  "target": "$HOME/.config",
+  "target": "$HOME/.config/hypr/",
   "pre_copy": ["sudo rm -rf ~/.config/hypr/*"],
   "post_copy": []
 },
