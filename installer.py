@@ -175,8 +175,8 @@ for dotfile in dotfiles_data:
 
 # Copy assets
 logger.info("Installing assets...")
-run("cp -r ./assets/backgrounds ~/.config/assets/")
-run("cp -r ./assets/wlogout ~/.config/assets/")
+run("cp -r ./assets/backgrounds $HOME/.config/assets/")
+run("cp -r ./assets/wlogout $HOME/.config/assets/")
 run("tar -xvf ./assets/themes/Catppuccin-Mocha.tar.xz /usr/share/themes/")
 run("tar -xvf ./assets/icons/Tela-circle-dracula.tar.xz /usr/share/icons/")
 
