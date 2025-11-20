@@ -9,4 +9,16 @@
   "target": "$HOME/.config",
   "pre_copy": ["sudo rm -rf ~/.config/hypr/*"],
   "post_copy": []
+},
+{
+  "source": "./assets/themes",
+  "target": "/usr/share/themes/",
+  "pre_copy": [],
+  "post_copy": []
+},
+{
+  "source": "./assets/icons",
+  "target": "/usr/share/icons/",
+  "pre_copy": [],
+  "post_copy": []
 }]
