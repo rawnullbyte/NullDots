@@ -96,22 +96,44 @@ EOF""")
 
 # Main packages
 packages = ""
-# Hyprland + core apps
-packages += "hyprland waybar alacritty fish "
+# Hyprland
+packages += "hyprland polkit-kde-agent xdg-desktop-portal-hyprland "
+# Hypr utils
+packages += "hyprpicker hyprlock hypridle wlogout "
+# Clipboard
+packages += "wl-clipboard cliphist "
+# Bar
+packages += "waybar "
+# Application launcher
+packages += "tofi "
 # Themes / appearance
-packages += "python-pywal wpgtk swww gradience kvantum kvantum-theme-materia "
-# Wayland utilities / screenshot / clipboard / notification
-packages += "cliphist wl-clipboard mako grim slurp swappy "
-# Power / audio / media control
-packages += "upower brightnessctl pavucontrol playerctl "
-# Network / bluetooth
-packages += "networkmanager bluez bluez-utils blueman "
+packages += "nwg-look kvantum kvantum-theme-catppuccin-git swww python-pywal "
+# Clipboard
+packages += "cliphist wl-clipboard "
+# Screenshot
+packages += "flameshot "
+# Notifications daemon
+packages += "dunst "
+# QT Support
+packages += "qt5-wayland qt6-wayland qt5ct qt6ct "
+# Power
+packages += "upower "
+# Brightness management
+packages += "brightnessctl "
+# Audio
+packages += "pipewire wireplumber pamixer "
+# Network
+packages += "networkmanager  "
+# Bluetooth
+packages += "bluez bluez-utils blueman "
 # Utilities
-packages += "fastfetch git stow "
+packages += "fastfetch git stow nano tar "
 # Fonts
-packages += "noto-fonts noto-fonts-emoji ttf-font-awesome "
-# Polkit / portal / display manager
-packages += "polkit-kde-agent xdg-desktop-portal-hyprland ly"
+packages += "ttf-cascadia-code-nerd ttf-cascadia-mono-nerd ttf-fira-code ttf-fira-mono ttf-fira-sans ttf-firacode-nerd ttf-iosevka-nerd ttf-iosevkaterm-nerd ttf-jetbrains-mono-nerd ttf-jetbrains-mono ttf-nerd-fonts-symbols ttf-nerd-fonts-symbols ttf-nerd-fonts-symbols-mono "
+# Terminal
+packages += "kitty fish "
+# Greeter
+packages += "ly "
 
 # Install all packages at once
 run(f"yay -S --noconfirm --needed {packages}")
@@ -141,7 +163,7 @@ for dotfile in dotfiles_data:
             if r != 0:
                 logger.error(f"Pre-copy command failed: {pre_copy}")
 
-    r = run(f"cp -rfT \"{source}\" \"{target}\"")
+    r = run(f"sudo cp -rfT \"{source}\" \"{target}\"")
     if r != 0:
         logger.error(f"Failed to copy {source} to {target}")
 
@@ -151,8 +173,23 @@ for dotfile in dotfiles_data:
             if r != 0:
                 logger.error(f"Post-copy command failed: {post_copy}")
 
+# Copy assets
+logger.info("Installing assets...")
+run("cp -r ./assets/backgrounds ~/.config/assets/")
+run("cp -r ./assets/wlogout ~/.config/assets/")
+run("tar -xvf ./assets/themes/Catppuccin-Mocha.tar.xz /usr/share/themes/")
+run("tar -xvf ./assets/icons/Tela-circle-dracula.tar.xz /usr/share/icons/")
+
 # Enable ly
 run("sudo systemctl enable ly.service")
 
 # Set ownership
 run(f"""sudo chown -R "{current_user}:{current_user}" /home/"{current_user}\"""")
+logger.info("""\nPost-installation instructions:
+Set themes and icons:
+   - Run 'nwg-look' and  set the global GTK and icon theme"
+   - Open 'kvantummanager' (run with sudo for system-wide changes) to select and apply the Catppuccin theme"
+   - Open 'qt6ct' to set the icon theme"
+
+------------------------------------------------------------------------""")
+logger.info("Installation complete! Please reboot your system.")

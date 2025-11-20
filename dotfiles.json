@@ -3,4 +3,10 @@
   "target": "/etc/ly",
   "pre_copy": [],
   "post_copy": []
+},
+{
+  "source": "./dotfiles/hypr",
+  "target": "~/.config",
+  "pre_copy": ["sudo rm -rf ~/.config/hypr/*"],
+  "post_copy": []
 }]
