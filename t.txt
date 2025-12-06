@@ -1,0 +1,3422 @@
+--- ./.git/description ---
+Unnamed repository; edit this file 'description' to name the repository.
+--- ./.git/hooks/applypatch-msg.sample ---
+#!/bin/sh
+#
+# An example hook script to check the commit log message taken by
+# applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.  The hook is
+# allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "applypatch-msg".
+
+. git-sh-setup
+commitmsg="$(git rev-parse --git-path hooks/commit-msg)"
+test -x "$commitmsg" && exec "$commitmsg" ${1+"$@"}
+:
+--- ./.git/hooks/commit-msg.sample ---
+#!/bin/sh
+#
+# An example hook script to check the commit log message.
+# Called by "git commit" with one argument, the name of the file
+# that has the commit message.  The hook should exit with non-zero
+# status after issuing an appropriate message if it wants to stop the
+# commit.  The hook is allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "commit-msg".
+
+# Uncomment the below to add a Signed-off-by line to the message.
+# Doing this in a hook is a bad idea in general, but the prepare-commit-msg
+# hook is more suited to it.
+#
+# SOB=$(git var GIT_AUTHOR_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# grep -qs "^$SOB" "$1" || echo "$SOB" >> "$1"
+
+# This example catches duplicate Signed-off-by lines.
+
+test "" = "$(grep '^Signed-off-by: ' "$1" |
+	 sort | uniq -c | sed -e '/^[ 	]*1[ 	]/d')" || {
+	echo >&2 Duplicate Signed-off-by lines.
+	exit 1
+}
+--- ./.git/hooks/fsmonitor-watchman.sample ---
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use IPC::Open2;
+
+# An example hook script to integrate Watchman
+# (https://facebook.github.io/watchman/) with git to speed up detecting
+# new and modified files.
+#
+# The hook is passed a version (currently 2) and last update token
+# formatted as a string and outputs to stdout a new update token and
+# all files that have been modified since the update token. Paths must
+# be relative to the root of the working tree and separated by a single NUL.
+#
+# To enable this hook, rename this file to "query-watchman" and set
+# 'git config core.fsmonitor .git/hooks/query-watchman'
+#
+my ($version, $last_update_token) = @ARGV;
+
+# Uncomment for debugging
+# print STDERR "$0 $version $last_update_token\n";
+
+# Check the hook interface version
+if ($version ne 2) {
+	die "Unsupported query-fsmonitor hook version '$version'.\n" .
+	    "Falling back to scanning...\n";
+}
+
+my $git_work_tree = get_working_dir();
+
+my $retry = 1;
+
+my $json_pkg;
+eval {
+	require JSON::XS;
+	$json_pkg = "JSON::XS";
+	1;
+} or do {
+	require JSON::PP;
+	$json_pkg = "JSON::PP";
+};
+
+launch_watchman();
+
+sub launch_watchman {
+	my $o = watchman_query();
+	if (is_work_tree_watched($o)) {
+		output_result($o->{clock}, @{$o->{files}});
+	}
+}
+
+sub output_result {
+	my ($clockid, @files) = @_;
+
+	# Uncomment for debugging watchman output
+	# open (my $fh, ">", ".git/watchman-output.out");
+	# binmode $fh, ":utf8";
+	# print $fh "$clockid\n@files\n";
+	# close $fh;
+
+	binmode STDOUT, ":utf8";
+	print $clockid;
+	print "\0";
+	local $, = "\0";
+	print @files;
+}
+
+sub watchman_clock {
+	my $response = qx/watchman clock "$git_work_tree"/;
+	die "Failed to get clock id on '$git_work_tree'.\n" .
+		"Falling back to scanning...\n" if $? != 0;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub watchman_query {
+	my $pid = open2(\*CHLD_OUT, \*CHLD_IN, 'watchman -j --no-pretty')
+	or die "open2() failed: $!\n" .
+	"Falling back to scanning...\n";
+
+	# In the query expression below we're asking for names of files that
+	# changed since $last_update_token but not from the .git folder.
+	#
+	# To accomplish this, we're using the "since" generator to use the
+	# recency index to select candidate nodes and "fields" to limit the
+	# output to file names only. Then we're using the "expression" term to
+	# further constrain the results.
+	my $last_update_line = "";
+	if (substr($last_update_token, 0, 1) eq "c") {
+		$last_update_token = "\"$last_update_token\"";
+		$last_update_line = qq[\n"since": $last_update_token,];
+	}
+	my $query = <<"	END";
+		["query", "$git_work_tree", {$last_update_line
+			"fields": ["name"],
+			"expression": ["not", ["dirname", ".git"]]
+		}]
+	END
+
+	# Uncomment for debugging the watchman query
+	# open (my $fh, ">", ".git/watchman-query.json");
+	# print $fh $query;
+	# close $fh;
+
+	print CHLD_IN $query;
+	close CHLD_IN;
+	my $response = do {local $/; <CHLD_OUT>};
+
+	# Uncomment for debugging the watch response
+	# open ($fh, ">", ".git/watchman-response.json");
+	# print $fh $response;
+	# close $fh;
+
+	die "Watchman: command returned no output.\n" .
+	"Falling back to scanning...\n" if $response eq "";
+	die "Watchman: command returned invalid output: $response\n" .
+	"Falling back to scanning...\n" unless $response =~ /^\{/;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub is_work_tree_watched {
+	my ($output) = @_;
+	my $error = $output->{error};
+	if ($retry > 0 and $error and $error =~ m/unable to resolve root .* directory (.*) is not watched/) {
+		$retry--;
+		my $response = qx/watchman watch "$git_work_tree"/;
+		die "Failed to make watchman watch '$git_work_tree'.\n" .
+		    "Falling back to scanning...\n" if $? != 0;
+		$output = $json_pkg->new->utf8->decode($response);
+		$error = $output->{error};
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		# Uncomment for debugging watchman output
+		# open (my $fh, ">", ".git/watchman-output.out");
+		# close $fh;
+
+		# Watchman will always return all files on the first query so
+		# return the fast "everything is dirty" flag to git and do the
+		# Watchman query just to get it over with now so we won't pay
+		# the cost in git to look up each individual file.
+		my $o = watchman_clock();
+		$error = $output->{error};
+
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		output_result($o->{clock}, ("/"));
+		$last_update_token = $o->{clock};
+
+		eval { launch_watchman() };
+		return 0;
+	}
+
+	die "Watchman: $error.\n" .
+	"Falling back to scanning...\n" if $error;
+
+	return 1;
+}
+
+sub get_working_dir {
+	my $working_dir;
+	if ($^O =~ 'msys' || $^O =~ 'cygwin') {
+		$working_dir = Win32::GetCwd();
+		$working_dir =~ tr/\\/\//;
+	} else {
+		require Cwd;
+		$working_dir = Cwd::cwd();
+	}
+
+	return $working_dir;
+}
+--- ./.git/hooks/post-update.sample ---
+#!/bin/sh
+#
+# An example hook script to prepare a packed repository for use over
+# dumb transports.
+#
+# To enable this hook, rename this file to "post-update".
+
+exec git update-server-info
+--- ./.git/hooks/pre-applypatch.sample ---
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed
+# by applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-applypatch".
+
+. git-sh-setup
+precommit="$(git rev-parse --git-path hooks/pre-commit)"
+test -x "$precommit" && exec "$precommit" ${1+"$@"}
+:
+--- ./.git/hooks/pre-commit.sample ---
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git commit" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message if
+# it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-commit".
+
+if git rev-parse --verify HEAD >/dev/null 2>&1
+then
+	against=HEAD
+else
+	# Initial commit: diff against an empty tree object
+	against=$(git hash-object -t tree /dev/null)
+fi
+
+# If you want to allow non-ASCII filenames set this variable to true.
+allownonascii=$(git config --type=bool hooks.allownonascii)
+
+# Redirect output to stderr.
+exec 1>&2
+
+# Cross platform projects tend to avoid non-ASCII filenames; prevent
+# them from being added to the repository. We exploit the fact that the
+# printable range starts at the space character and ends with tilde.
+if [ "$allownonascii" != "true" ] &&
+	# Note that the use of brackets around a tr range is ok here, (it's
+	# even required, for portability to Solaris 10's /usr/bin/tr), since
+	# the square bracket bytes happen to fall in the designated range.
+	test $(git diff-index --cached --name-only --diff-filter=A -z $against |
+	  LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0
+then
+	cat <<\EOF
+Error: Attempt to add a non-ASCII file name.
+
+This can cause problems if you want to work with people on other platforms.
+
+To be portable it is advisable to rename the file.
+
+If you know what you are doing you can disable this check using:
+
+  git config hooks.allownonascii true
+EOF
+	exit 1
+fi
+
+# If there are whitespace errors, print the offending file names and fail.
+exec git diff-index --check --cached $against --
+--- ./.git/hooks/pre-merge-commit.sample ---
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git merge" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message to
+# stderr if it wants to stop the merge commit.
+#
+# To enable this hook, rename this file to "pre-merge-commit".
+
+. git-sh-setup
+test -x "$GIT_DIR/hooks/pre-commit" &&
+        exec "$GIT_DIR/hooks/pre-commit"
+:
+--- ./.git/hooks/pre-push.sample ---
+#!/bin/sh
+
+# An example hook script to verify what is about to be pushed.  Called by "git
+# push" after it has checked the remote status, but before anything has been
+# pushed.  If this script exits with a non-zero status nothing will be pushed.
+#
+# This hook is called with the following parameters:
+#
+# $1 -- Name of the remote to which the push is being done
+# $2 -- URL to which the push is being done
+#
+# If pushing without using a named remote those arguments will be equal.
+#
+# Information about the commits which are being pushed is supplied as lines to
+# the standard input in the form:
+#
+#   <local ref> <local oid> <remote ref> <remote oid>
+#
+# This sample shows how to prevent push of commits where the log message starts
+# with "WIP" (work in progress).
+
+remote="$1"
+url="$2"
+
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+
+while read local_ref local_oid remote_ref remote_oid
+do
+	if test "$local_oid" = "$zero"
+	then
+		# Handle delete
+		:
+	else
+		if test "$remote_oid" = "$zero"
+		then
+			# New branch, examine all commits
+			range="$local_oid"
+		else
+			# Update to existing branch, examine new commits
+			range="$remote_oid..$local_oid"
+		fi
+
+		# Check for WIP commit
+		commit=$(git rev-list -n 1 --grep '^WIP' "$range")
+		if test -n "$commit"
+		then
+			echo >&2 "Found WIP commit in $local_ref, not pushing"
+			exit 1
+		fi
+	fi
+done
+
+exit 0
+--- ./.git/hooks/pre-rebase.sample ---
+#!/bin/sh
+#
+# Copyright (c) 2006, 2008 Junio C Hamano
+#
+# The "pre-rebase" hook is run just before "git rebase" starts doing
+# its job, and can prevent the command from running by exiting with
+# non-zero status.
+#
+# The hook is called with the following parameters:
+#
+# $1 -- the upstream the series was forked from.
+# $2 -- the branch being rebased (or empty when rebasing the current branch).
+#
+# This sample shows how to prevent topic branches that are already
+# merged to 'next' branch from getting rebased, because allowing it
+# would result in rebasing already published history.
+
+publish=next
+basebranch="$1"
+if test "$#" = 2
+then
+	topic="refs/heads/$2"
+else
+	topic=`git symbolic-ref HEAD` ||
+	exit 0 ;# we do not interrupt rebasing detached HEAD
+fi
+
+case "$topic" in
+refs/heads/??/*)
+	;;
+*)
+	exit 0 ;# we do not interrupt others.
+	;;
+esac
+
+# Now we are dealing with a topic branch being rebased
+# on top of master.  Is it OK to rebase it?
+
+# Does the topic really exist?
+git show-ref -q "$topic" || {
+	echo >&2 "No such branch $topic"
+	exit 1
+}
+
+# Is topic fully merged to master?
+not_in_master=`git rev-list --pretty=oneline ^master "$topic"`
+if test -z "$not_in_master"
+then
+	echo >&2 "$topic is fully merged to master; better remove it."
+	exit 1 ;# we could allow it, but there is no point.
+fi
+
+# Is topic ever merged to next?  If so you should not be rebasing it.
+only_next_1=`git rev-list ^master "^$topic" ${publish} | sort`
+only_next_2=`git rev-list ^master           ${publish} | sort`
+if test "$only_next_1" = "$only_next_2"
+then
+	not_in_topic=`git rev-list "^$topic" master`
+	if test -z "$not_in_topic"
+	then
+		echo >&2 "$topic is already up to date with master"
+		exit 1 ;# we could allow it, but there is no point.
+	else
+		exit 0
+	fi
+else
+	not_in_next=`git rev-list --pretty=oneline ^${publish} "$topic"`
+	/usr/bin/perl -e '
+		my $topic = $ARGV[0];
+		my $msg = "* $topic has commits already merged to public branch:\n";
+		my (%not_in_next) = map {
+			/^([0-9a-f]+) /;
+			($1 => 1);
+		} split(/\n/, $ARGV[1]);
+		for my $elem (map {
+				/^([0-9a-f]+) (.*)$/;
+				[$1 => $2];
+			} split(/\n/, $ARGV[2])) {
+			if (!exists $not_in_next{$elem->[0]}) {
+				if ($msg) {
+					print STDERR $msg;
+					undef $msg;
+				}
+				print STDERR " $elem->[1]\n";
+			}
+		}
+	' "$topic" "$not_in_next" "$not_in_master"
+	exit 1
+fi
+
+<<\DOC_END
+
+This sample hook safeguards topic branches that have been
+published from being rewound.
+
+The workflow assumed here is:
+
+ * Once a topic branch forks from "master", "master" is never
+   merged into it again (either directly or indirectly).
+
+ * Once a topic branch is fully cooked and merged into "master",
+   it is deleted.  If you need to build on top of it to correct
+   earlier mistakes, a new topic branch is created by forking at
+   the tip of the "master".  This is not strictly necessary, but
+   it makes it easier to keep your history simple.
+
+ * Whenever you need to test or publish your changes to topic
+   branches, merge them into "next" branch.
+
+The script, being an example, hardcodes the publish branch name
+to be "next", but it is trivial to make it configurable via
+$GIT_DIR/config mechanism.
+
+With this workflow, you would want to know:
+
+(1) ... if a topic branch has ever been merged to "next".  Young
+    topic branches can have stupid mistakes you would rather
+    clean up before publishing, and things that have not been
+    merged into other branches can be easily rebased without
+    affecting other people.  But once it is published, you would
+    not want to rewind it.
+
+(2) ... if a topic branch has been fully merged to "master".
+    Then you can delete it.  More importantly, you should not
+    build on top of it -- other people may already want to
+    change things related to the topic as patches against your
+    "master", so if you need further changes, it is better to
+    fork the topic (perhaps with the same name) afresh from the
+    tip of "master".
+
+Let's look at this example:
+
+		   o---o---o---o---o---o---o---o---o---o "next"
+		  /       /           /           /
+		 /   a---a---b A     /           /
+		/   /               /           /
+	       /   /   c---c---c---c B         /
+	      /   /   /             \         /
+	     /   /   /   b---b C     \       /
+	    /   /   /   /             \     /
+    ---o---o---o---o---o---o---o---o---o---o---o "master"
+
+
+A, B and C are topic branches.
+
+ * A has one fix since it was merged up to "next".
+
+ * B has finished.  It has been fully merged up to "master" and "next",
+   and is ready to be deleted.
+
+ * C has not merged to "next" at all.
+
+We would want to allow C to be rebased, refuse A, and encourage
+B to be deleted.
+
+To compute (1):
+
+	git rev-list ^master ^topic next
+	git rev-list ^master        next
+
+	if these match, topic has not merged in next at all.
+
+To compute (2):
+
+	git rev-list master..topic
+
+	if this is empty, it is fully merged to "master".
+
+DOC_END
+--- ./.git/hooks/pre-receive.sample ---
+#!/bin/sh
+#
+# An example hook script to make use of push options.
+# The example simply echoes all push options that start with 'echoback='
+# and rejects all pushes when the "reject" push option is used.
+#
+# To enable this hook, rename this file to "pre-receive".
+
+if test -n "$GIT_PUSH_OPTION_COUNT"
+then
+	i=0
+	while test "$i" -lt "$GIT_PUSH_OPTION_COUNT"
+	do
+		eval "value=\$GIT_PUSH_OPTION_$i"
+		case "$value" in
+		echoback=*)
+			echo "echo from the pre-receive-hook: ${value#*=}" >&2
+			;;
+		reject)
+			exit 1
+		esac
+		i=$((i + 1))
+	done
+fi
+--- ./.git/hooks/prepare-commit-msg.sample ---
+#!/bin/sh
+#
+# An example hook script to prepare the commit log message.
+# Called by "git commit" with the name of the file that has the
+# commit message, followed by the description of the commit
+# message's source.  The hook's purpose is to edit the commit
+# message file.  If the hook fails with a non-zero status,
+# the commit is aborted.
+#
+# To enable this hook, rename this file to "prepare-commit-msg".
+
+# This hook includes three examples. The first one removes the
+# "# Please enter the commit message..." help message.
+#
+# The second includes the output of "git diff --name-status -r"
+# into the message, just before the "git status" output.  It is
+# commented because it doesn't cope with --amend or with squashed
+# commits.
+#
+# The third example adds a Signed-off-by line to the message, that can
+# still be edited.  This is rarely a good idea.
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+SHA1=$3
+
+/usr/bin/perl -i.bak -ne 'print unless(m/^. Please enter the commit message/..m/^#$/)' "$COMMIT_MSG_FILE"
+
+# case "$COMMIT_SOURCE,$SHA1" in
+#  ,|template,)
+#    /usr/bin/perl -i.bak -pe '
+#       print "\n" . `git diff --cached --name-status -r`
+# 	 if /^#/ && $first++ == 0' "$COMMIT_MSG_FILE" ;;
+#  *) ;;
+# esac
+
+# SOB=$(git var GIT_COMMITTER_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# git interpret-trailers --in-place --trailer "$SOB" "$COMMIT_MSG_FILE"
+# if test -z "$COMMIT_SOURCE"
+# then
+#   /usr/bin/perl -i.bak -pe 'print "\n" if !$first_line++' "$COMMIT_MSG_FILE"
+# fi
+--- ./.git/hooks/push-to-checkout.sample ---
+#!/bin/sh
+
+# An example hook script to update a checked-out tree on a git push.
+#
+# This hook is invoked by git-receive-pack(1) when it reacts to git
+# push and updates reference(s) in its repository, and when the push
+# tries to update the branch that is currently checked out and the
+# receive.denyCurrentBranch configuration variable is set to
+# updateInstead.
+#
+# By default, such a push is refused if the working tree and the index
+# of the remote repository has any difference from the currently
+# checked out commit; when both the working tree and the index match
+# the current commit, they are updated to match the newly pushed tip
+# of the branch. This hook is to be used to override the default
+# behaviour; however the code below reimplements the default behaviour
+# as a starting point for convenient modification.
+#
+# The hook receives the commit with which the tip of the current
+# branch is going to be updated:
+commit=$1
+
+# It can exit with a non-zero status to refuse the push (when it does
+# so, it must not modify the index or the working tree).
+die () {
+	echo >&2 "$*"
+	exit 1
+}
+
+# Or it can make any necessary changes to the working tree and to the
+# index to bring them to the desired state when the tip of the current
+# branch is updated to the new commit, and exit with a zero status.
+#
+# For example, the hook can simply run git read-tree -u -m HEAD "$1"
+# in order to emulate git fetch that is run in the reverse direction
+# with git push, as the two-tree form of git read-tree -u -m is
+# essentially the same as git switch or git checkout that switches
+# branches while keeping the local changes in the working tree that do
+# not interfere with the difference between the branches.
+
+# The below is a more-or-less exact translation to shell of the C code
+# for the default behaviour for git's push-to-checkout hook defined in
+# the push_to_deploy() function in builtin/receive-pack.c.
+#
+# Note that the hook will be executed from the repository directory,
+# not from the working tree, so if you want to perform operations on
+# the working tree, you will have to adapt your code accordingly, e.g.
+# by adding "cd .." or using relative paths.
+
+if ! git update-index -q --ignore-submodules --refresh
+then
+	die "Up-to-date check failed"
+fi
+
+if ! git diff-files --quiet --ignore-submodules --
+then
+	die "Working directory has unstaged changes"
+fi
+
+# This is a rough translation of:
+#
+#   head_has_history() ? "HEAD" : EMPTY_TREE_SHA1_HEX
+if git cat-file -e HEAD 2>/dev/null
+then
+	head=HEAD
+else
+	head=$(git hash-object -t tree --stdin </dev/null)
+fi
+
+if ! git diff-index --quiet --cached --ignore-submodules $head --
+then
+	die "Working directory has staged changes"
+fi
+
+if ! git read-tree -u -m "$commit"
+then
+	die "Could not update working tree to new HEAD"
+fi
+--- ./.git/hooks/sendemail-validate.sample ---
+#!/bin/sh
+
+# An example hook script to validate a patch (and/or patch series) before
+# sending it via email.
+#
+# The hook should exit with non-zero status after issuing an appropriate
+# message if it wants to prevent the email(s) from being sent.
+#
+# To enable this hook, rename this file to "sendemail-validate".
+#
+# By default, it will only check that the patch(es) can be applied on top of
+# the default upstream branch without conflicts in a secondary worktree. After
+# validation (successful or not) of the last patch of a series, the worktree
+# will be deleted.
+#
+# The following config variables can be set to change the default remote and
+# remote ref that are used to apply the patches against:
+#
+#   sendemail.validateRemote (default: origin)
+#   sendemail.validateRemoteRef (default: HEAD)
+#
+# Replace the TODO placeholders with appropriate checks according to your
+# needs.
+
+validate_cover_letter () {
+	file="$1"
+	# TODO: Replace with appropriate checks (e.g. spell checking).
+	true
+}
+
+validate_patch () {
+	file="$1"
+	# Ensure that the patch applies without conflicts.
+	git am -3 "$file" || return
+	# TODO: Replace with appropriate checks for this patch
+	# (e.g. checkpatch.pl).
+	true
+}
+
+validate_series () {
+	# TODO: Replace with appropriate checks for the whole series
+	# (e.g. quick build, coding style checks, etc.).
+	true
+}
+
+# main -------------------------------------------------------------------------
+
+if test "$GIT_SENDEMAIL_FILE_COUNTER" = 1
+then
+	remote=$(git config --default origin --get sendemail.validateRemote) &&
+	ref=$(git config --default HEAD --get sendemail.validateRemoteRef) &&
+	worktree=$(mktemp --tmpdir -d sendemail-validate.XXXXXXX) &&
+	git worktree add -fd --checkout "$worktree" "refs/remotes/$remote/$ref" &&
+	git config --replace-all sendemail.validateWorktree "$worktree"
+else
+	worktree=$(git config --get sendemail.validateWorktree)
+fi || {
+	echo "sendemail-validate: error: failed to prepare worktree" >&2
+	exit 1
+}
+
+unset GIT_DIR GIT_WORK_TREE
+cd "$worktree" &&
+
+if grep -q "^diff --git " "$1"
+then
+	validate_patch "$1"
+else
+	validate_cover_letter "$1"
+fi &&
+
+if test "$GIT_SENDEMAIL_FILE_COUNTER" = "$GIT_SENDEMAIL_FILE_TOTAL"
+then
+	git config --unset-all sendemail.validateWorktree &&
+	trap 'git worktree remove -ff "$worktree"' EXIT &&
+	validate_series
+fi
+--- ./.git/hooks/update.sample ---
+#!/bin/sh
+#
+# An example hook script to block unannotated tags from entering.
+# Called by "git receive-pack" with arguments: refname sha1-old sha1-new
+#
+# To enable this hook, rename this file to "update".
+#
+# Config
+# ------
+# hooks.allowunannotated
+#   This boolean sets whether unannotated tags will be allowed into the
+#   repository.  By default they won't be.
+# hooks.allowdeletetag
+#   This boolean sets whether deleting tags will be allowed in the
+#   repository.  By default they won't be.
+# hooks.allowmodifytag
+#   This boolean sets whether a tag may be modified after creation. By default
+#   it won't be.
+# hooks.allowdeletebranch
+#   This boolean sets whether deleting branches will be allowed in the
+#   repository.  By default they won't be.
+# hooks.denycreatebranch
+#   This boolean sets whether remotely creating branches will be denied
+#   in the repository.  By default this is allowed.
+#
+
+# --- Command line
+refname="$1"
+oldrev="$2"
+newrev="$3"
+
+# --- Safety check
+if [ -z "$GIT_DIR" ]; then
+	echo "Don't run this script from the command line." >&2
+	echo " (if you want, you could supply GIT_DIR then run" >&2
+	echo "  $0 <ref> <oldrev> <newrev>)" >&2
+	exit 1
+fi
+
+if [ -z "$refname" -o -z "$oldrev" -o -z "$newrev" ]; then
+	echo "usage: $0 <ref> <oldrev> <newrev>" >&2
+	exit 1
+fi
+
+# --- Config
+allowunannotated=$(git config --type=bool hooks.allowunannotated)
+allowdeletebranch=$(git config --type=bool hooks.allowdeletebranch)
+denycreatebranch=$(git config --type=bool hooks.denycreatebranch)
+allowdeletetag=$(git config --type=bool hooks.allowdeletetag)
+allowmodifytag=$(git config --type=bool hooks.allowmodifytag)
+
+# check for no description
+projectdesc=$(sed -e '1q' "$GIT_DIR/description")
+case "$projectdesc" in
+"Unnamed repository"* | "")
+	echo "*** Project description file hasn't been set" >&2
+	exit 1
+	;;
+esac
+
+# --- Check types
+# if $newrev is 0000...0000, it's a commit to delete a ref.
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+if [ "$newrev" = "$zero" ]; then
+	newrev_type=delete
+else
+	newrev_type=$(git cat-file -t $newrev)
+fi
+
+case "$refname","$newrev_type" in
+	refs/tags/*,commit)
+		# un-annotated tag
+		short_refname=${refname##refs/tags/}
+		if [ "$allowunannotated" != "true" ]; then
+			echo "*** The un-annotated tag, $short_refname, is not allowed in this repository" >&2
+			echo "*** Use 'git tag [ -a | -s ]' for tags you want to propagate." >&2
+			exit 1
+		fi
+		;;
+	refs/tags/*,delete)
+		# delete tag
+		if [ "$allowdeletetag" != "true" ]; then
+			echo "*** Deleting a tag is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/tags/*,tag)
+		# annotated tag
+		if [ "$allowmodifytag" != "true" ] && git rev-parse $refname > /dev/null 2>&1
+		then
+			echo "*** Tag '$refname' already exists." >&2
+			echo "*** Modifying a tag is not allowed in this repository." >&2
+			exit 1
+		fi
+		;;
+	refs/heads/*,commit)
+		# branch
+		if [ "$oldrev" = "$zero" -a "$denycreatebranch" = "true" ]; then
+			echo "*** Creating a branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/heads/*,delete)
+		# delete branch
+		if [ "$allowdeletebranch" != "true" ]; then
+			echo "*** Deleting a branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/remotes/*,commit)
+		# tracking branch
+		;;
+	refs/remotes/*,delete)
+		# delete tracking branch
+		if [ "$allowdeletebranch" != "true" ]; then
+			echo "*** Deleting a tracking branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	*)
+		# Anything else (is there anything else?)
+		echo "*** Update hook: unknown type of update to ref $refname of type $newrev_type" >&2
+		exit 1
+		;;
+esac
+
+# --- Finished
+exit 0
+--- ./.git/info/exclude ---
+# git ls-files --others --exclude-from=.git/info/exclude
+# Lines that start with '#' are comments.
+# For a project mostly in C, the following would be a good set of
+# exclude patterns (uncomment them if you want to use them):
+# *.[oa]
+# *~
+--- ./.git/info/refs ---
+05a892adb682f09720cf3799c347ec5d5b763a31	refs/heads/main
+31455614e1ca313e65dc1955e527d44bd102c64d	refs/remotes/origin/HEAD
+31455614e1ca313e65dc1955e527d44bd102c64d	refs/remotes/origin/main
+--- ./.git/refs/heads/main ---
+d2f3838796b1ed0702666edd988709580442af2f
+--- ./.git/refs/remotes/origin/main ---
+d2f3838796b1ed0702666edd988709580442af2f
+--- ./.git/refs/remotes/origin/HEAD ---
+ref: refs/remotes/origin/main
+--- ./.git/HEAD ---
+ref: refs/heads/main
+--- ./.git/objects/info/packs ---
+P pack-62b9d7d69316d1e3435ad1381b426f2831da9272.pack
+
+--- ./.git/COMMIT_EDITMSG ---
+Update dotfiles.json
+--- ./.git/logs/refs/heads/main ---
+0000000000000000000000000000000000000000 4da7f322f05de91b70bd1527e18edf98b8b23417 rawnullbyte <andrexyt2012@gmail.com> 1763505122 +0100	commit (initial): Initial commit
+4da7f322f05de91b70bd1527e18edf98b8b23417 3847c40ae3a29f0e16f8ba250150e9b053d43f58 rawnullbyte <andrexyt2012@gmail.com> 1763505146 +0100	commit: .
+3847c40ae3a29f0e16f8ba250150e9b053d43f58 9e78c40ec062d9251dd770e05d63729d171cd47f rawnullbyte <andrexyt2012@gmail.com> 1763565112 +0100	commit: Update install.sh
+9e78c40ec062d9251dd770e05d63729d171cd47f c18c62731ade422ed82929b2049d7f6214d0216c rawnullbyte <andrexyt2012@gmail.com> 1763565285 +0100	commit: Update install.sh
+c18c62731ade422ed82929b2049d7f6214d0216c 1037053b3ec8105db4a9998362406804a2a401a2 rawnullbyte <andrexyt2012@gmail.com> 1763565843 +0100	commit: Update install.sh
+1037053b3ec8105db4a9998362406804a2a401a2 c9168681226223cdf36fd5e59d1ea8e93a39e37f rawnullbyte <andrexyt2012@gmail.com> 1763569750 +0100	commit: use python
+c9168681226223cdf36fd5e59d1ea8e93a39e37f ea963e48a390ed9999c7db544d3da98f83c80612 rawnullbyte <andrexyt2012@gmail.com> 1763569811 +0100	commit: Update installer.py
+ea963e48a390ed9999c7db544d3da98f83c80612 49b9067783aa51e469ca11147e6534ab267be0aa rawnullbyte <andrexyt2012@gmail.com> 1763569841 +0100	commit: Update installer.py
+49b9067783aa51e469ca11147e6534ab267be0aa 640e6186b43854b6fc3d5bd72262a044818de9e6 rawnullbyte <andrexyt2012@gmail.com> 1763569868 +0100	commit: Update installer.py
+640e6186b43854b6fc3d5bd72262a044818de9e6 66affcd4de8b832470b03fb0d3e406516b44ed43 rawnullbyte <andrexyt2012@gmail.com> 1763570002 +0100	commit: Update installer.py
+66affcd4de8b832470b03fb0d3e406516b44ed43 76931406d5b2a4f1b64bd133bd1368f653d26072 rawnullbyte <andrexyt2012@gmail.com> 1763570315 +0100	commit: Update installer.py
+76931406d5b2a4f1b64bd133bd1368f653d26072 5d543aba574984d24b6012071af43a204c7527c6 rawnullbyte <andrexyt2012@gmail.com> 1763570680 +0100	commit: Update installer.py
+5d543aba574984d24b6012071af43a204c7527c6 9274742db796dc2a85113f3e5f64384149592865 rawnullbyte <andrexyt2012@gmail.com> 1763571159 +0100	commit: .
+9274742db796dc2a85113f3e5f64384149592865 fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 rawnullbyte <andrexyt2012@gmail.com> 1763571387 +0100	commit: Update installer.py
+fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 4083d23da55ce740ec640b24d83ed89289ffae9c rawnullbyte <andrexyt2012@gmail.com> 1763571515 +0100	commit: Update installer.py
+4083d23da55ce740ec640b24d83ed89289ffae9c 0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 rawnullbyte <andrexyt2012@gmail.com> 1763571636 +0100	commit: Update installer.py
+0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 b1c1a869ccd80acb245d019f134eed42285442e4 rawnullbyte <andrexyt2012@gmail.com> 1763572264 +0100	commit: Update installer.py
+b1c1a869ccd80acb245d019f134eed42285442e4 fc92d4a9685536bbbb679488f7b48b86b2fcf155 rawnullbyte <andrexyt2012@gmail.com> 1763572321 +0100	commit: Update installer.py
+fc92d4a9685536bbbb679488f7b48b86b2fcf155 4357bf05bdca4470a23d439bf389c75e5cdb2e06 rawnullbyte <andrexyt2012@gmail.com> 1763572761 +0100	commit: Update installer.py
+4357bf05bdca4470a23d439bf389c75e5cdb2e06 8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 rawnullbyte <andrexyt2012@gmail.com> 1763572810 +0100	commit: Update installer.py
+8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 9a96e6f14507b30eec554ef50871ff380a0e01ef rawnullbyte <andrexyt2012@gmail.com> 1763586541 +0100	commit: Update installer.py
+9a96e6f14507b30eec554ef50871ff380a0e01ef baccadd1718d1d4386cafa6d55d9d8133a9e75a1 rawnullbyte <andrexyt2012@gmail.com> 1763586637 +0100	commit: Update installer.py
+baccadd1718d1d4386cafa6d55d9d8133a9e75a1 a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 rawnullbyte <andrexyt2012@gmail.com> 1763586897 +0100	commit: Update installer.py
+a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 308d29b5779423eb285a600f531eb665ba28a264 rawnullbyte <andrexyt2012@gmail.com> 1763587068 +0100	commit: Update installer.py
+308d29b5779423eb285a600f531eb665ba28a264 5a0175cba6cbc21db234bac30741d8e4aef7b9fb rawnullbyte <andrexyt2012@gmail.com> 1763587478 +0100	commit: Update installer.py
+5a0175cba6cbc21db234bac30741d8e4aef7b9fb 7ddc89d1a34e717b6a06f4d61ac352b564616df6 rawnullbyte <andrexyt2012@gmail.com> 1763675093 +0100	commit: .
+7ddc89d1a34e717b6a06f4d61ac352b564616df6 389f4a5e50feeb0c9bf0e5abbe948bda1c5e29c2 rawnullbyte <andrexyt2012@gmail.com> 1763675666 +0100	commit: Update installer.py
+389f4a5e50feeb0c9bf0e5abbe948bda1c5e29c2 31455614e1ca313e65dc1955e527d44bd102c64d rawnullbyte <andrexyt2012@gmail.com> 1763675874 +0100	commit: Update dotfiles.json
+31455614e1ca313e65dc1955e527d44bd102c64d 05a892adb682f09720cf3799c347ec5d5b763a31 rawnullbyte <andrexyt2012@gmail.com> 1763676103 +0100	commit: .
+05a892adb682f09720cf3799c347ec5d5b763a31 da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 rawnullbyte <andrexyt2012@gmail.com> 1763676163 +0100	commit: Update installer.py
+da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 a53e293897c10adc1760a022a72b7d6ece58effb rawnullbyte <andrexyt2012@gmail.com> 1763676217 +0100	commit: Update installer.py
+a53e293897c10adc1760a022a72b7d6ece58effb 36e2c061976214fa45ca6a328c79885f22bd0991 rawnullbyte <andrexyt2012@gmail.com> 1763676351 +0100	commit: Update installer.py
+36e2c061976214fa45ca6a328c79885f22bd0991 06584e3d7b8461e0ed835904b67a413aae042b84 rawnullbyte <andrexyt2012@gmail.com> 1763676472 +0100	commit: Update dotfiles.json
+06584e3d7b8461e0ed835904b67a413aae042b84 e7589090ed9bfc7ae05730af902f90047830257c rawnullbyte <andrexyt2012@gmail.com> 1763676782 +0100	commit: Update hyprland.conf
+e7589090ed9bfc7ae05730af902f90047830257c d2f3838796b1ed0702666edd988709580442af2f rawnullbyte <andrexyt2012@gmail.com> 1763677259 +0100	commit: Update dotfiles.json
+--- ./.git/logs/refs/remotes/origin/HEAD ---
+0000000000000000000000000000000000000000 4da7f322f05de91b70bd1527e18edf98b8b23417 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763505143 +0100	remote set-head
+3847c40ae3a29f0e16f8ba250150e9b053d43f58 3847c40ae3a29f0e16f8ba250150e9b053d43f58 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763505151 +0100	remote set-head
+9e78c40ec062d9251dd770e05d63729d171cd47f 9e78c40ec062d9251dd770e05d63729d171cd47f nullbyte <nullbyte@nullbyte-laptop.(none)> 1763565114 +0100	remote set-head
+c18c62731ade422ed82929b2049d7f6214d0216c c18c62731ade422ed82929b2049d7f6214d0216c nullbyte <nullbyte@nullbyte-laptop.(none)> 1763565304 +0100	remote set-head
+1037053b3ec8105db4a9998362406804a2a401a2 1037053b3ec8105db4a9998362406804a2a401a2 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763565845 +0100	remote set-head
+1037053b3ec8105db4a9998362406804a2a401a2 1037053b3ec8105db4a9998362406804a2a401a2 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763569742 +0100	remote set-head
+c9168681226223cdf36fd5e59d1ea8e93a39e37f c9168681226223cdf36fd5e59d1ea8e93a39e37f nullbyte <nullbyte@nullbyte-laptop.(none)> 1763569753 +0100	remote set-head
+ea963e48a390ed9999c7db544d3da98f83c80612 ea963e48a390ed9999c7db544d3da98f83c80612 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763569814 +0100	remote set-head
+49b9067783aa51e469ca11147e6534ab267be0aa 49b9067783aa51e469ca11147e6534ab267be0aa nullbyte <nullbyte@nullbyte-laptop.(none)> 1763569843 +0100	remote set-head
+640e6186b43854b6fc3d5bd72262a044818de9e6 640e6186b43854b6fc3d5bd72262a044818de9e6 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763569870 +0100	remote set-head
+66affcd4de8b832470b03fb0d3e406516b44ed43 66affcd4de8b832470b03fb0d3e406516b44ed43 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763570004 +0100	remote set-head
+76931406d5b2a4f1b64bd133bd1368f653d26072 76931406d5b2a4f1b64bd133bd1368f653d26072 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763570319 +0100	remote set-head
+5d543aba574984d24b6012071af43a204c7527c6 5d543aba574984d24b6012071af43a204c7527c6 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763570683 +0100	remote set-head
+9274742db796dc2a85113f3e5f64384149592865 9274742db796dc2a85113f3e5f64384149592865 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763571162 +0100	remote set-head
+fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763571394 +0100	remote set-head
+4083d23da55ce740ec640b24d83ed89289ffae9c 4083d23da55ce740ec640b24d83ed89289ffae9c nullbyte <nullbyte@nullbyte-laptop.(none)> 1763571517 +0100	remote set-head
+0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763571638 +0100	remote set-head
+b1c1a869ccd80acb245d019f134eed42285442e4 b1c1a869ccd80acb245d019f134eed42285442e4 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763572268 +0100	remote set-head
+fc92d4a9685536bbbb679488f7b48b86b2fcf155 fc92d4a9685536bbbb679488f7b48b86b2fcf155 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763572324 +0100	remote set-head
+4357bf05bdca4470a23d439bf389c75e5cdb2e06 4357bf05bdca4470a23d439bf389c75e5cdb2e06 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763572763 +0100	remote set-head
+8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763572812 +0100	remote set-head
+8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763574895 +0100	remote set-head
+8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763576770 +0100	remote set-head
+9a96e6f14507b30eec554ef50871ff380a0e01ef 9a96e6f14507b30eec554ef50871ff380a0e01ef nullbyte <nullbyte@nullbyte-laptop.(none)> 1763586543 +0100	remote set-head
+a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763586900 +0100	remote set-head
+308d29b5779423eb285a600f531eb665ba28a264 308d29b5779423eb285a600f531eb665ba28a264 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763587071 +0100	remote set-head
+5a0175cba6cbc21db234bac30741d8e4aef7b9fb 5a0175cba6cbc21db234bac30741d8e4aef7b9fb nullbyte <nullbyte@nullbyte-laptop.(none)> 1763587480 +0100	remote set-head
+7ddc89d1a34e717b6a06f4d61ac352b564616df6 7ddc89d1a34e717b6a06f4d61ac352b564616df6 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763675096 +0100	remote set-head
+31455614e1ca313e65dc1955e527d44bd102c64d 31455614e1ca313e65dc1955e527d44bd102c64d nullbyte <nullbyte@nullbyte-laptop.(none)> 1763675876 +0100	remote set-head
+05a892adb682f09720cf3799c347ec5d5b763a31 05a892adb682f09720cf3799c347ec5d5b763a31 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763676110 +0100	remote set-head
+da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763676165 +0100	remote set-head
+a53e293897c10adc1760a022a72b7d6ece58effb a53e293897c10adc1760a022a72b7d6ece58effb nullbyte <nullbyte@nullbyte-laptop.(none)> 1763676220 +0100	remote set-head
+36e2c061976214fa45ca6a328c79885f22bd0991 36e2c061976214fa45ca6a328c79885f22bd0991 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763676366 +0100	remote set-head
+06584e3d7b8461e0ed835904b67a413aae042b84 06584e3d7b8461e0ed835904b67a413aae042b84 nullbyte <nullbyte@nullbyte-laptop.(none)> 1763676474 +0100	remote set-head
+e7589090ed9bfc7ae05730af902f90047830257c e7589090ed9bfc7ae05730af902f90047830257c nullbyte <nullbyte@nullbyte-laptop.(none)> 1763676784 +0100	remote set-head
+d2f3838796b1ed0702666edd988709580442af2f d2f3838796b1ed0702666edd988709580442af2f nullbyte <nullbyte@nullbyte-laptop.(none)> 1763677264 +0100	remote set-head
+--- ./.git/logs/refs/remotes/origin/main ---
+0000000000000000000000000000000000000000 4da7f322f05de91b70bd1527e18edf98b8b23417 rawnullbyte <andrexyt2012@gmail.com> 1763505142 +0100	update by push
+4da7f322f05de91b70bd1527e18edf98b8b23417 3847c40ae3a29f0e16f8ba250150e9b053d43f58 rawnullbyte <andrexyt2012@gmail.com> 1763505150 +0100	update by push
+3847c40ae3a29f0e16f8ba250150e9b053d43f58 9e78c40ec062d9251dd770e05d63729d171cd47f rawnullbyte <andrexyt2012@gmail.com> 1763565114 +0100	update by push
+9e78c40ec062d9251dd770e05d63729d171cd47f c18c62731ade422ed82929b2049d7f6214d0216c rawnullbyte <andrexyt2012@gmail.com> 1763565303 +0100	update by push
+c18c62731ade422ed82929b2049d7f6214d0216c 1037053b3ec8105db4a9998362406804a2a401a2 rawnullbyte <andrexyt2012@gmail.com> 1763565845 +0100	update by push
+1037053b3ec8105db4a9998362406804a2a401a2 c9168681226223cdf36fd5e59d1ea8e93a39e37f rawnullbyte <andrexyt2012@gmail.com> 1763569752 +0100	update by push
+c9168681226223cdf36fd5e59d1ea8e93a39e37f ea963e48a390ed9999c7db544d3da98f83c80612 rawnullbyte <andrexyt2012@gmail.com> 1763569813 +0100	update by push
+ea963e48a390ed9999c7db544d3da98f83c80612 49b9067783aa51e469ca11147e6534ab267be0aa rawnullbyte <andrexyt2012@gmail.com> 1763569842 +0100	update by push
+49b9067783aa51e469ca11147e6534ab267be0aa 640e6186b43854b6fc3d5bd72262a044818de9e6 rawnullbyte <andrexyt2012@gmail.com> 1763569869 +0100	update by push
+640e6186b43854b6fc3d5bd72262a044818de9e6 66affcd4de8b832470b03fb0d3e406516b44ed43 rawnullbyte <andrexyt2012@gmail.com> 1763570003 +0100	update by push
+66affcd4de8b832470b03fb0d3e406516b44ed43 76931406d5b2a4f1b64bd133bd1368f653d26072 rawnullbyte <andrexyt2012@gmail.com> 1763570318 +0100	update by push
+76931406d5b2a4f1b64bd133bd1368f653d26072 5d543aba574984d24b6012071af43a204c7527c6 rawnullbyte <andrexyt2012@gmail.com> 1763570682 +0100	update by push
+5d543aba574984d24b6012071af43a204c7527c6 9274742db796dc2a85113f3e5f64384149592865 rawnullbyte <andrexyt2012@gmail.com> 1763571161 +0100	update by push
+9274742db796dc2a85113f3e5f64384149592865 fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 rawnullbyte <andrexyt2012@gmail.com> 1763571393 +0100	update by push
+fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 4083d23da55ce740ec640b24d83ed89289ffae9c rawnullbyte <andrexyt2012@gmail.com> 1763571517 +0100	update by push
+4083d23da55ce740ec640b24d83ed89289ffae9c 0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 rawnullbyte <andrexyt2012@gmail.com> 1763571637 +0100	update by push
+0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 b1c1a869ccd80acb245d019f134eed42285442e4 rawnullbyte <andrexyt2012@gmail.com> 1763572267 +0100	update by push
+b1c1a869ccd80acb245d019f134eed42285442e4 fc92d4a9685536bbbb679488f7b48b86b2fcf155 rawnullbyte <andrexyt2012@gmail.com> 1763572323 +0100	update by push
+fc92d4a9685536bbbb679488f7b48b86b2fcf155 4357bf05bdca4470a23d439bf389c75e5cdb2e06 rawnullbyte <andrexyt2012@gmail.com> 1763572763 +0100	update by push
+4357bf05bdca4470a23d439bf389c75e5cdb2e06 8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 rawnullbyte <andrexyt2012@gmail.com> 1763572812 +0100	update by push
+8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 9a96e6f14507b30eec554ef50871ff380a0e01ef rawnullbyte <andrexyt2012@gmail.com> 1763586542 +0100	update by push
+9a96e6f14507b30eec554ef50871ff380a0e01ef a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 rawnullbyte <andrexyt2012@gmail.com> 1763586899 +0100	update by push
+a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 308d29b5779423eb285a600f531eb665ba28a264 rawnullbyte <andrexyt2012@gmail.com> 1763587070 +0100	update by push
+308d29b5779423eb285a600f531eb665ba28a264 5a0175cba6cbc21db234bac30741d8e4aef7b9fb rawnullbyte <andrexyt2012@gmail.com> 1763587479 +0100	update by push
+5a0175cba6cbc21db234bac30741d8e4aef7b9fb 7ddc89d1a34e717b6a06f4d61ac352b564616df6 rawnullbyte <andrexyt2012@gmail.com> 1763675096 +0100	update by push
+7ddc89d1a34e717b6a06f4d61ac352b564616df6 31455614e1ca313e65dc1955e527d44bd102c64d rawnullbyte <andrexyt2012@gmail.com> 1763675875 +0100	update by push
+31455614e1ca313e65dc1955e527d44bd102c64d 05a892adb682f09720cf3799c347ec5d5b763a31 rawnullbyte <andrexyt2012@gmail.com> 1763676109 +0100	update by push
+05a892adb682f09720cf3799c347ec5d5b763a31 da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 rawnullbyte <andrexyt2012@gmail.com> 1763676164 +0100	update by push
+da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 a53e293897c10adc1760a022a72b7d6ece58effb rawnullbyte <andrexyt2012@gmail.com> 1763676219 +0100	update by push
+a53e293897c10adc1760a022a72b7d6ece58effb 36e2c061976214fa45ca6a328c79885f22bd0991 rawnullbyte <andrexyt2012@gmail.com> 1763676365 +0100	update by push
+36e2c061976214fa45ca6a328c79885f22bd0991 06584e3d7b8461e0ed835904b67a413aae042b84 rawnullbyte <andrexyt2012@gmail.com> 1763676473 +0100	update by push
+06584e3d7b8461e0ed835904b67a413aae042b84 e7589090ed9bfc7ae05730af902f90047830257c rawnullbyte <andrexyt2012@gmail.com> 1763676783 +0100	update by push
+e7589090ed9bfc7ae05730af902f90047830257c d2f3838796b1ed0702666edd988709580442af2f rawnullbyte <andrexyt2012@gmail.com> 1763677263 +0100	update by push
+--- ./.git/logs/HEAD ---
+0000000000000000000000000000000000000000 4da7f322f05de91b70bd1527e18edf98b8b23417 rawnullbyte <andrexyt2012@gmail.com> 1763505122 +0100	commit (initial): Initial commit
+4da7f322f05de91b70bd1527e18edf98b8b23417 3847c40ae3a29f0e16f8ba250150e9b053d43f58 rawnullbyte <andrexyt2012@gmail.com> 1763505146 +0100	commit: .
+3847c40ae3a29f0e16f8ba250150e9b053d43f58 9e78c40ec062d9251dd770e05d63729d171cd47f rawnullbyte <andrexyt2012@gmail.com> 1763565112 +0100	commit: Update install.sh
+9e78c40ec062d9251dd770e05d63729d171cd47f c18c62731ade422ed82929b2049d7f6214d0216c rawnullbyte <andrexyt2012@gmail.com> 1763565285 +0100	commit: Update install.sh
+c18c62731ade422ed82929b2049d7f6214d0216c 1037053b3ec8105db4a9998362406804a2a401a2 rawnullbyte <andrexyt2012@gmail.com> 1763565843 +0100	commit: Update install.sh
+1037053b3ec8105db4a9998362406804a2a401a2 c9168681226223cdf36fd5e59d1ea8e93a39e37f rawnullbyte <andrexyt2012@gmail.com> 1763569750 +0100	commit: use python
+c9168681226223cdf36fd5e59d1ea8e93a39e37f ea963e48a390ed9999c7db544d3da98f83c80612 rawnullbyte <andrexyt2012@gmail.com> 1763569811 +0100	commit: Update installer.py
+ea963e48a390ed9999c7db544d3da98f83c80612 49b9067783aa51e469ca11147e6534ab267be0aa rawnullbyte <andrexyt2012@gmail.com> 1763569841 +0100	commit: Update installer.py
+49b9067783aa51e469ca11147e6534ab267be0aa 640e6186b43854b6fc3d5bd72262a044818de9e6 rawnullbyte <andrexyt2012@gmail.com> 1763569868 +0100	commit: Update installer.py
+640e6186b43854b6fc3d5bd72262a044818de9e6 66affcd4de8b832470b03fb0d3e406516b44ed43 rawnullbyte <andrexyt2012@gmail.com> 1763570002 +0100	commit: Update installer.py
+66affcd4de8b832470b03fb0d3e406516b44ed43 76931406d5b2a4f1b64bd133bd1368f653d26072 rawnullbyte <andrexyt2012@gmail.com> 1763570315 +0100	commit: Update installer.py
+76931406d5b2a4f1b64bd133bd1368f653d26072 5d543aba574984d24b6012071af43a204c7527c6 rawnullbyte <andrexyt2012@gmail.com> 1763570680 +0100	commit: Update installer.py
+5d543aba574984d24b6012071af43a204c7527c6 9274742db796dc2a85113f3e5f64384149592865 rawnullbyte <andrexyt2012@gmail.com> 1763571159 +0100	commit: .
+9274742db796dc2a85113f3e5f64384149592865 fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 rawnullbyte <andrexyt2012@gmail.com> 1763571387 +0100	commit: Update installer.py
+fe2fa9fcffb0de5bb9bfb17b22ece213d1b049f8 4083d23da55ce740ec640b24d83ed89289ffae9c rawnullbyte <andrexyt2012@gmail.com> 1763571515 +0100	commit: Update installer.py
+4083d23da55ce740ec640b24d83ed89289ffae9c 0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 rawnullbyte <andrexyt2012@gmail.com> 1763571636 +0100	commit: Update installer.py
+0c6cee6ce4d03dd711e93b6465ac77f3b9fc0d36 b1c1a869ccd80acb245d019f134eed42285442e4 rawnullbyte <andrexyt2012@gmail.com> 1763572264 +0100	commit: Update installer.py
+b1c1a869ccd80acb245d019f134eed42285442e4 fc92d4a9685536bbbb679488f7b48b86b2fcf155 rawnullbyte <andrexyt2012@gmail.com> 1763572321 +0100	commit: Update installer.py
+fc92d4a9685536bbbb679488f7b48b86b2fcf155 4357bf05bdca4470a23d439bf389c75e5cdb2e06 rawnullbyte <andrexyt2012@gmail.com> 1763572761 +0100	commit: Update installer.py
+4357bf05bdca4470a23d439bf389c75e5cdb2e06 8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 rawnullbyte <andrexyt2012@gmail.com> 1763572810 +0100	commit: Update installer.py
+8a8651d57bdd02a9270cb1f8683e6cdb1cf558e9 9a96e6f14507b30eec554ef50871ff380a0e01ef rawnullbyte <andrexyt2012@gmail.com> 1763586541 +0100	commit: Update installer.py
+9a96e6f14507b30eec554ef50871ff380a0e01ef baccadd1718d1d4386cafa6d55d9d8133a9e75a1 rawnullbyte <andrexyt2012@gmail.com> 1763586637 +0100	commit: Update installer.py
+baccadd1718d1d4386cafa6d55d9d8133a9e75a1 a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 rawnullbyte <andrexyt2012@gmail.com> 1763586897 +0100	commit: Update installer.py
+a7f7bfa427fd77b9cc1f7c73d51a582078c6be62 308d29b5779423eb285a600f531eb665ba28a264 rawnullbyte <andrexyt2012@gmail.com> 1763587068 +0100	commit: Update installer.py
+308d29b5779423eb285a600f531eb665ba28a264 5a0175cba6cbc21db234bac30741d8e4aef7b9fb rawnullbyte <andrexyt2012@gmail.com> 1763587478 +0100	commit: Update installer.py
+5a0175cba6cbc21db234bac30741d8e4aef7b9fb 7ddc89d1a34e717b6a06f4d61ac352b564616df6 rawnullbyte <andrexyt2012@gmail.com> 1763675093 +0100	commit: .
+7ddc89d1a34e717b6a06f4d61ac352b564616df6 389f4a5e50feeb0c9bf0e5abbe948bda1c5e29c2 rawnullbyte <andrexyt2012@gmail.com> 1763675666 +0100	commit: Update installer.py
+389f4a5e50feeb0c9bf0e5abbe948bda1c5e29c2 31455614e1ca313e65dc1955e527d44bd102c64d rawnullbyte <andrexyt2012@gmail.com> 1763675874 +0100	commit: Update dotfiles.json
+31455614e1ca313e65dc1955e527d44bd102c64d 05a892adb682f09720cf3799c347ec5d5b763a31 rawnullbyte <andrexyt2012@gmail.com> 1763676103 +0100	commit: .
+05a892adb682f09720cf3799c347ec5d5b763a31 da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 rawnullbyte <andrexyt2012@gmail.com> 1763676163 +0100	commit: Update installer.py
+da61f8bbaffb3b89aefe376841ab3c8f95c9e7d5 a53e293897c10adc1760a022a72b7d6ece58effb rawnullbyte <andrexyt2012@gmail.com> 1763676217 +0100	commit: Update installer.py
+a53e293897c10adc1760a022a72b7d6ece58effb 36e2c061976214fa45ca6a328c79885f22bd0991 rawnullbyte <andrexyt2012@gmail.com> 1763676351 +0100	commit: Update installer.py
+36e2c061976214fa45ca6a328c79885f22bd0991 06584e3d7b8461e0ed835904b67a413aae042b84 rawnullbyte <andrexyt2012@gmail.com> 1763676472 +0100	commit: Update dotfiles.json
+06584e3d7b8461e0ed835904b67a413aae042b84 e7589090ed9bfc7ae05730af902f90047830257c rawnullbyte <andrexyt2012@gmail.com> 1763676782 +0100	commit: Update hyprland.conf
+e7589090ed9bfc7ae05730af902f90047830257c d2f3838796b1ed0702666edd988709580442af2f rawnullbyte <andrexyt2012@gmail.com> 1763677259 +0100	commit: Update dotfiles.json
+--- ./.git/FETCH_HEAD ---
+d2f3838796b1ed0702666edd988709580442af2f		branch 'main' of https://github.com/rawnullbyte/NullDots
+--- ./.git/config ---
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[lfs]
+	repositoryformatversion = 0
+[remote "origin"]
+	url = https://github.com/rawnullbyte/NullDots.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+	merge = refs/heads/main
+	vscode-merge-base = origin/main
+--- ./.git/packed-refs ---
+# pack-refs with: peeled fully-peeled sorted 
+05a892adb682f09720cf3799c347ec5d5b763a31 refs/heads/main
+31455614e1ca313e65dc1955e527d44bd102c64d refs/remotes/origin/main
+--- ./.gitattributes ---
+# Auto detect text files and perform LF normalization
+* text=auto
+--- ./dotfiles/cava/Wall-Dcol ---
+
+[color]
+
+ gradient = 1
+ gradient_count = 8
+ gradient_color_1 = '#293352'
+ gradient_color_2 = '#3A476B'
+ gradient_color_3 = '#4B737D'
+ gradient_color_4 = '#57848F'
+ gradient_color_5 = '#A39B65'
+ gradient_color_6 = '#C2B87A'
+ gradient_color_7 = '#E69AB3'
+ gradient_color_8 = '#F0AAC1'
+--- ./dotfiles/cava/config ---
+## Configuration file for CAVA. Default values are commented out. Use either ';' or '#' for commenting.
+
+
+[general]
+
+# Smoothing mode. Can be 'normal', 'scientific' or 'waves'. DEPRECATED as of 0.6.0
+; mode = normal
+
+# Accepts only non-negative values.
+; framerate = 60
+
+# 'autosens' will attempt to decrease sensitivity if the bars peak. 1 = on, 0 = off
+# new as of 0.6.0 autosens of low values (dynamic range)
+# 'overshoot' allows bars to overshoot (in % of terminal height) without initiating autosens. DEPRECATED as of 0.6.0
+; autosens = 1
+; overshoot = 20
+
+# Manual sensitivity in %. If autosens is enabled, this will only be the initial value.
+# 200 means double height. Accepts only non-negative values.
+; sensitivity = 100
+
+# The number of bars (0-200). 0 sets it to auto (fill up console).
+# Bars' width and space between bars in number of characters.
+; bars = 0
+ bar_width = 3
+ bar_spacing = 1
+
+# For SDL width and space between bars is in pixels, defaults are:
+; bar_width = 1
+; bar_spacing = 0
+
+
+# Lower and higher cutoff frequencies for lowest and highest bars
+# the bandwidth of the visualizer.
+# Note: there is a minimum total bandwidth of 43Mhz x number of bars.
+# Cava will automatically increase the higher cutoff if a too low band is specified.
+; lower_cutoff_freq = 50
+; higher_cutoff_freq = 10000
+
+
+# Seconds with no input before cava goes to sleep mode. Cava will not perform FFT or drawing and
+# only check for input once per second. Cava will wake up once input is detected. 0 = disable.
+; sleep_timer = 0
+
+
+[input]
+
+# Audio capturing method. Possible methods are: 'pulse', 'alsa', 'fifo', 'sndio' or 'shmem'
+# Defaults to 'pulse', 'alsa' or 'fifo', in that order, dependent on what support cava was built with.
+#
+# All input methods uses the same config variable 'source'
+# to define where it should get the audio.
+#
+# For pulseaudio 'source' will be the source. Default: 'auto', which uses the monitor source of the default sink
+# (all pulseaudio sinks(outputs) have 'monitor' sources(inputs) associated with them).
+#
+# For alsa 'source' will be the capture device.
+# For fifo 'source' will be the path to fifo-file.
+# For shmem 'source' will be /squeezelite-AA:BB:CC:DD:EE:FF where 'AA:BB:CC:DD:EE:FF' will be squeezelite's MAC address
+ method = pipewire
+ source = auto
+
+; method = alsa
+; source = hw:Loopback,1
+
+; method = fifo
+; source = /tmp/mpd.fifo
+; sample_rate = 44100
+; sample_bits = 16
+
+; method = shmem
+; source = /squeezelite-AA:BB:CC:DD:EE:FF
+
+; method = portaudio
+; source = auto
+
+
+[output]
+
+# Output method. Can be 'ncurses', 'noncurses', 'raw' or 'sdl'.
+# 'noncurses' uses a custom framebuffer technique and prints only changes
+# from frame to frame in the terminal. 'ncurses' is default if supported.
+#
+# 'raw' is an 8 or 16 bit (configurable via the 'bit_format' option) data
+# stream of the bar heights that can be used to send to other applications.
+# 'raw' defaults to 200 bars, which can be adjusted in the 'bars' option above.
+#
+# 'sdl' uses the Simple DirectMedia Layer to render in a graphical context.
+; method = ncurses
+
+# Visual channels. Can be 'stereo' or 'mono'.
+# 'stereo' mirrors both channels with low frequencies in center.
+# 'mono' outputs left to right lowest to highest frequencies.
+# 'mono_option' set mono to either take input from 'left', 'right' or 'average'.
+; channels = stereo
+; mono_option = average
+
+# Raw output target. A fifo will be created if target does not exist.
+; raw_target = /dev/stdout
+
+# Raw data format. Can be 'binary' or 'ascii'.
+; data_format = binary
+
+# Binary bit format, can be '8bit' (0-255) or '16bit' (0-65530).
+; bit_format = 16bit
+
+# Ascii max value. In 'ascii' mode range will run from 0 to value specified here
+; ascii_max_range = 1000
+
+# Ascii delimiters. In ascii format each bar and frame is separated by a delimiters.
+# Use decimal value in ascii table (i.e. 59 = ';' and 10 = '\n' (line feed)).
+; bar_delimiter = 59
+; frame_delimiter = 10
+
+# sdl window size and position. -1,-1 is centered.
+; sdl_width = 1000
+; sdl_height = 500
+; sdl_x = -1
+; sdl_y= -1
+
+[color]
+
+# Colors can be one of seven predefined: black, blue, cyan, green, magenta, red, white, yellow.
+# Or defined by hex code '#xxxxxx' (hex code must be within ''). User defined colors requires
+# ncurses output method and a terminal that can change color definitions such as Gnome-terminal or rxvt.
+# if supported, ncurses mode will be forced on if user defined colors are used.
+# default is to keep current terminal color
+; background = default
+; foreground = default
+
+# SDL only support hex code colors, these are the default:
+; background = '#111111'
+; foreground = '#33cccc'
+
+
+# Gradient mode, only hex defined colors (and thereby ncurses mode) are supported,
+# background must also be defined in hex  or remain commented out. 1 = on, 0 = off.
+# You can define as many as 8 different colors. They range from bottom to top of screen
+# In the [color] section
+
+[color]
+
+gradient = 1
+
+gradient_color_1 = '#0D0F0D'
+gradient_color_2 = '#93A4B0'
+gradient_color_3 = '#CABFB3'
+gradient_color_4 = '#B6CCDB'
+gradient_color_5 = '#e1eaef'
+gradient_color_6 = '#A4B7C5'
+gradient_color_7 = '#B6CCDB'
+gradient_color_8 = '#e1eaef'
+
+
+
+[smoothing]
+
+# Percentage value for integral smoothing. Takes values from 0 - 100.
+# Higher values means smoother, but less precise. 0 to disable.
+; integral = 77
+
+# Disables or enables the so-called "Monstercat smoothing" with or without "waves". Set to 0 to disable.
+; monstercat = 0
+; waves = 0
+
+# Set gravity percentage for "drop off". Higher values means bars will drop faster.
+# Accepts only non-negative values. 50 means half gravity, 200 means double. Set to 0 to disable "drop off".
+; gravity = 100
+
+
+# In bar height, bars that would have been lower that this will not be drawn.
+; ignore = 0
+
+
+[eq]
+
+# This one is tricky. You can have as much keys as you want.
+# Remember to uncomment more then one key! More keys = more precision.
+# Look at readme.md on github for further explanations and examples.
+; 1 = 1 # bass
+; 2 = 1
+; 3 = 1 # midtone
+; 4 = 1
+; 5 = 1 # treble
+### HYPRDOTS CAVA: Autogenerated line below for wallbash###
+
+[color]
+
+ gradient = 1
+ gradient_count = 8
+ gradient_color_1 = '#2C526E' 
+ gradient_color_2 = '#567b95'
+ gradient_color_3 = '#83A6BF'
+ gradient_color_4 = '#DEC386'
+ gradient_color_5 = '#F5DD9D'
+ gradient_color_6 = '#E69AB3'
+ gradient_color_7 = '#F0AAC1'
+ gradient_color_8 = '#F7C3D2'
+--- ./dotfiles/cava/config.bak ---
+## Configuration file for CAVA.
+# Remove the ; to change parameters.
+
+
+[general]
+
+# Smoothing mode. Can be 'normal', 'scientific' or 'waves'. DEPRECATED as of 0.6.0
+; mode = normal
+
+# Accepts only non-negative values.
+; framerate = 60
+
+# 'autosens' will attempt to decrease sensitivity if the bars peak. 1 = on, 0 = off
+# new as of 0.6.0 autosens of low values (dynamic range)
+# 'overshoot' allows bars to overshoot (in % of terminal height) without initiating autosens. DEPRECATED as of 0.6.0
+; autosens = 1
+; overshoot = 20
+
+# Manual sensitivity in %. If autosens is enabled, this will only be the initial value.
+# 200 means double height. Accepts only non-negative values.
+; sensitivity = 100
+
+# The number of bars (0-512). 0 sets it to auto (fill up console).
+# Bars' width and space between bars in number of characters.
+; bars = 0
+; bar_width = 2
+; bar_spacing = 1
+# bar_height is only used for output in "noritake" format
+; bar_height = 32
+
+# For SDL width and space between bars is in pixels, defaults are:
+; bar_width = 20
+; bar_spacing = 5
+
+# sdl_glsl have these default values, they are only used to calculate max number of bars.
+; bar_width = 1
+; bar_spacing = 0
+
+# ceter bars in terminal, if there is space.
+; center_align = 1
+
+# max height of bars in terminal, in percent of terminal height.
+; max_height = 100
+
+
+# Lower and higher cutoff frequencies for lowest and highest bars
+# the bandwidth of the visualizer.
+# Note: there is a minimum total bandwidth of 43Mhz x number of bars.
+# Cava will automatically increase the higher cutoff if a too low band is specified.
+; lower_cutoff_freq = 50
+; higher_cutoff_freq = 10000
+
+
+# Seconds with no input before cava goes to sleep mode. Cava will not perform FFT or drawing and
+# only check for input once per second. Cava will wake up once input is detected. 0 = disable.
+; sleep_timer = 0
+
+
+[input]
+
+# Audio capturing method. Possible methods are: 'fifo', 'portaudio', 'pipewire', 'alsa', 'pulse', 'sndio', 'oss', 'jack' or 'shmem'
+# Defaults to 'oss', 'pipewire', 'sndio', 'jack', 'pulse', 'alsa', 'portaudio' or 'fifo', in that order, dependent on what support cava was built with.
+# On Mac it defaults to 'portaudio' or 'fifo'
+# On windows this is automatic and no input settings are needed.
+#
+# All input methods uses the same config variable 'source'
+# to define where it should get the audio.
+#
+# For pulseaudio and pipewire 'source' will be the source. Default: 'auto', which uses the monitor source of the default sink
+# (all pulseaudio sinks(outputs) have 'monitor' sources(inputs) associated with them).
+#
+# For pipewire 'source' will be the object name or object.serial of the device to capture from.
+# Both input and output devices are supported. To capture the monitor source of a sink node, append '.monitor' to the sink's object name.
+#
+# For alsa 'source' will be the capture device.
+# For fifo 'source' will be the path to fifo-file.
+# For shmem 'source' will be /squeezelite-AA:BB:CC:DD:EE:FF where 'AA:BB:CC:DD:EE:FF' will be squeezelite's MAC address
+#
+# For sndio 'source' will be a raw recording audio descriptor or a monitoring sub-device, e.g. 'rsnd/2' or 'snd/1'. Default: 'default'.
+# README.md contains further information on how to setup CAVA for sndio.
+#
+# For oss 'source' will be the path to a audio device, e.g. '/dev/dsp2'. Default: '/dev/dsp', i.e. the default audio device.
+# README.md contains further information on how to setup CAVA for OSS on FreeBSD.
+#
+# For jack 'source' will be the name of the JACK server to connect to, e.g. 'foobar'. Default: 'default'.
+# README.md contains further information on how to setup CAVA for JACK.
+#
+; method = pulse
+; source = auto
+
+; method = pipewire
+; source = auto
+
+; method = alsa
+; source = hw:Loopback,1
+
+; method = fifo
+; source = /tmp/mpd.fifo
+
+; method = shmem
+; source = /squeezelite-AA:BB:CC:DD:EE:FF
+
+; method = portaudio
+; source = auto
+
+; method = sndio
+; source = default
+
+; method = oss
+; source = /dev/dsp
+
+; method = jack
+; source = default
+
+# The options 'sample_rate', 'sample_bits', 'channels' and 'autoconnect' can be configured for some input methods:
+#   sample_rate: fifo, pipewire, sndio, oss
+#   sample_bits: fifo, pipewire, sndio, oss
+#   channels:    sndio, oss, jack
+#   autoconnect: jack
+# Other methods ignore these settings.
+# For pipewire, sample_rate will default to 48000, for all other input methods, sample_rate will default to 44100.
+#
+# For 'sndio' and 'oss' they are only preferred values, i.e. if the values are not supported
+# by the chosen audio device, the device will use other supported values instead.
+# Example: 48000, 32 and 2, but the device only supports 44100, 16 and 1, then it
+# will use 44100, 16 and 1.
+#
+#
+# The 'pipewire' input method has three options to control linking and mixing:
+#   active: Force the node to always process. Useful for monitoring sources when no other application is active.
+#   remix: Allow pipewire to remix audio channels to match cava's channel count. Useful for surround sound.
+#   virtual: Set the node to virtual, to avoid recording notifications from the DE.
+#
+; sample_rate = 44100
+; sample_bits = 16
+; channels = 2
+; autoconnect = 2
+; active = 0
+; remix = 1
+; virtual = 1
+
+
+[output]
+
+# Output method. Can be 'ncurses', 'noncurses', 'raw', 'noritake', 'sdl'
+# or 'sdl_glsl'.
+# 'noncurses' (default) uses a buffer and cursor movements to only print
+# changes from frame to frame in the terminal. Uses less resources and is less
+# prone to tearing (vsync issues) than 'ncurses'.
+#
+# 'raw' is an 8 or 16 bit (configurable via the 'bit_format' option) data
+# stream of the bar heights that can be used to send to other applications.
+# 'raw' defaults to 1024 bars stereo (512 bars mono), which can be adjusted in the 'bars' option above.
+#
+# 'noritake' outputs a bitmap in the format expected by a Noritake VFD display
+#  in graphic mode. It only support the 3000 series graphical VFDs for now.
+#
+# 'sdl' uses the Simple DirectMedia Layer to render in a graphical context.
+# 'sdl_glsl' uses SDL to create an OpenGL context. Write your own shaders or
+# use one of the predefined ones.
+; method = noncurses
+
+# Orientation of the visualization. Can be 'bottom', 'top', 'left', 'right' or
+# 'horizontal'. Default is 'bottom'. 'left and 'right' are only supported on sdl
+# and ncruses output. 'horizontal' (bars go up and down from center) is only supported
+# on noncurses output.
+# Note: many fonts have weird or missing glyphs for characters used in orientations
+# other than 'bottom', which can make output not look right.
+; orientation = bottom
+
+# Visual channels. Can be 'stereo' or 'mono'.
+# 'stereo' mirrors both channels with low frequencies in center.
+# 'mono' outputs left to right lowest to highest frequencies.
+# 'mono_option' set mono to either take input from 'left', 'right' or 'average'.
+# set 'reverse' to 1 to display frequencies the other way around.
+; channels = stereo
+; mono_option = average
+; reverse = 0
+
+# Raw output target.
+# On Linux, a fifo will be created if target does not exist.
+# On Windows, a named pipe will be created if target does not exist.
+; raw_target = /dev/stdout
+
+# Raw data format. Can be 'binary' or 'ascii'.
+; data_format = binary
+
+# Binary bit format, can be '8bit' (0-255) or '16bit' (0-65530).
+; bit_format = 16bit
+
+# Ascii max value. In 'ascii' mode range will run from 0 to value specified here
+; ascii_max_range = 1000
+
+# Ascii delimiters. In ascii format each bar and frame is separated by a delimiters.
+# Use decimal value in ascii table (i.e. 59 = ';' and 10 = '\n' (line feed)).
+; bar_delimiter = 59
+; frame_delimiter = 10
+
+# sdl window size and position. -1,-1 is centered.
+; sdl_width = 1024
+; sdl_height = 512
+; sdl_x = -1
+; sdl_y= -1
+; sdl_full_screen = 0
+
+# set label on bars on the x-axis. Can be 'frequency' or 'none'. Default: 'none'
+# 'frequency' displays the lower cut off frequency of the bar above.
+# Only supported on ncurses and noncurses output.
+; xaxis = none
+ 
+# enable synchronized sync. 1 = on, 0 = off
+# removes flickering in alacritty terminal emulator.
+# defaults to off since the behaviour in other terminal emulators is unknown
+; synchronized_sync = 0
+
+# Shaders for sdl_glsl, located in $HOME/.config/cava/shaders
+; vertex_shader = pass_through.vert
+; fragment_shader = bar_spectrum.frag
+
+; for glsl output mode, keep rendering even if no audio
+; continuous_rendering = 0
+
+# disable console blank (screen saver) in tty
+# (Not supported on FreeBSD)
+; disable_blanking = 0
+
+# show a flat bar at the bottom of the screen when idle, 1 = on, 0 = off
+; show_idle_bar_heads = 1
+
+# show waveform instead of frequency spectrum, 1 = on, 0 = off
+; waveform = 0
+
+[color]
+
+# Colors can be one of seven predefined: black, blue, cyan, green, magenta, red, white, yellow.
+# Or defined by hex code '#xxxxxx' (hex code must be within ''). User defined colors requires
+# a terminal that can change color definitions such as Gnome-terminal or rxvt.
+# default is to keep current terminal color
+; background = default
+; foreground = default
+
+# SDL and sdl_glsl only support hex code colors, these are the default:
+; background = '#111111'
+; foreground = '#33ffff'
+
+
+# Gradient mode, only hex defined colors are supported,
+# background must also be defined in hex or remain commented out. 1 = on, 0 = off.
+# You can define as many as 8 different colors. They range from bottom to top of screen
+; gradient = 0
+; gradient_color_1 = '#59cc33'
+; gradient_color_2 = '#80cc33'
+; gradient_color_3 = '#a6cc33'
+; gradient_color_4 = '#cccc33'
+; gradient_color_5 = '#cca633'
+; gradient_color_6 = '#cc8033'
+; gradient_color_7 = '#cc5933'
+; gradient_color_8 = '#cc3333'
+
+
+# Horizontal is only supported on noncurses output.
+# Only one color will be calculated per bar.
+; horizontal_gradient = 0
+; horizontal_gradient_color_1 = '#c45161'
+; horizontal_gradient_color_2 = '#e094a0'
+; horizontal_gradient_color_3 = '#f2b6c0'
+; horizontal_gradient_color_4 = '#f2dde1'
+; horizontal_gradient_color_5 = '#cbc7d8'
+; horizontal_gradient_color_6 = '#8db7d2'
+; horizontal_gradient_color_7 = '#5e62a9'
+; horizontal_gradient_color_8 = '#434279'
+
+
+# If both vertical and horizontal gradient is enabled, vertical will be blended in this direction.
+# Can be 'up', 'down', 'left' or 'right'. 'up' means the vertical gradient will be blended in from
+# bottom to top. I.e. the bottom will be only the horizontal
+# and top will be only the color of the vertical gradient.
+; blend_direction = 'up'
+
+# use theme file instead of defining colors in this file
+# themes are located in $HOME/.config/cava/themes
+; theme = 'none'
+
+
+[smoothing]
+
+# Percentage value for integral smoothing. Takes values from 0 - 100.
+# Higher values means smoother, but less precise. 0 to disable.
+# DEPRECATED as of 0.8.0, use noise_reduction instead
+; integral = 77
+
+# Disables or enables the so-called "Monstercat smoothing" with or without "waves". Set to 0 to disable.
+; monstercat = 0
+; waves = 0
+
+# Set gravity percentage for "drop off". Higher values means bars will drop faster.
+# Accepts only non-negative values. 50 means half gravity, 200 means double. Set to 0 to disable "drop off".
+# DEPRECATED as of 0.8.0, use noise_reduction instead
+; gravity = 100
+
+
+# In bar height, bars that would have been lower that this will not be drawn.
+# DEPRECATED as of 0.8.0
+; ignore = 0
+
+# Noise reduction, int 0 - 100. default 77
+# the raw visualization is very noisy, this factor adjusts the integral and gravity filters to keep the signal smooth
+# 100 will be very slow and smooth, 0 will be fast but noisy.
+; noise_reduction = 77
+
+
+[eq]
+
+# This one is tricky. You can have as much keys as you want.
+# Remember to uncomment more than one key! More keys = more precision.
+# Look at readme.md on github for further explanations and examples.
+; 1 = 1 # bass
+; 2 = 1
+; 3 = 1 # midtone
+; 4 = 1
+; 5 = 1 # treble
+--- ./dotfiles/cava/shaders/bar_spectrum.frag ---
+#version 330
+
+in vec2 fragCoord;
+out vec4 fragColor;
+
+// bar values. defaults to left channels first (low to high), then right (high to low).
+uniform float bars[512];
+
+uniform int bars_count;  // number of bars (left + right) (configurable)
+uniform int bar_width;   // bar width (configurable), not used here
+uniform int bar_spacing; // space bewteen bars (configurable)
+
+uniform vec3 u_resolution; // window resolution
+
+// colors, configurable in cava config file (r,g,b) (0.0 - 1.0)
+uniform vec3 bg_color; // background color
+uniform vec3 fg_color; // foreground color
+
+uniform int gradient_count;
+uniform vec3 gradient_colors[8]; // gradient colors
+
+uniform float shader_time; // shader execution time s (not used here)
+
+uniform sampler2D inputTexture; // Texture from the last render pass (not used here)
+
+vec3 normalize_C(float y, vec3 col_1, vec3 col_2, float y_min, float y_max) {
+    // create color based on fraction of this color and next color
+    float yr = (y - y_min) / (y_max - y_min);
+    return col_1 * (1.0 - yr) + col_2 * yr;
+}
+
+void main() {
+    // find which bar to use based on where we are on the x axis
+    float x = u_resolution.x * fragCoord.x;
+    int bar = int(bars_count * fragCoord.x);
+
+    // calculate a bar size
+    float bar_size = u_resolution.x / bars_count;
+
+    // the y coordinate and bar values are the same
+    float y = bars[bar];
+
+    // make sure there is a thin line at bottom
+    if (y * u_resolution.y < 1.0) {
+        y = 1.0 / u_resolution.y;
+    }
+
+    // draw the bar up to current height
+    if (y > fragCoord.y) {
+        // make some space between bars basen on settings
+        if (x > (bar + 1) * (bar_size)-bar_spacing) {
+            fragColor = vec4(bg_color, 1.0);
+        } else {
+            if (gradient_count == 0) {
+                fragColor = vec4(fg_color, 1.0);
+            } else {
+                // find which color in the configured gradient we are at
+                int color = int((gradient_count - 1) * fragCoord.y);
+
+                // find where on y this and next color is supposed to be
+                float y_min = color / (gradient_count - 1.0);
+                float y_max = (color + 1.0) / (gradient_count - 1.0);
+
+                // make color
+                fragColor = vec4(normalize_C(fragCoord.y, gradient_colors[color],
+                                             gradient_colors[color + 1], y_min, y_max),
+                                 1.0);
+            }
+        }
+    } else {
+        fragColor = vec4(bg_color, 1.0);
+    }
+}--- ./dotfiles/cava/shaders/eye_of_phi.frag ---
+#version 330
+
+// this shader was stolen from shadertoy user ChunderFPV
+
+#define SCALE 8.0
+#define PI radians(180.0)
+#define TAU (PI * 2.0)
+#define CS(a) vec2(cos(a), sin(a))
+#define PT(u, r) smoothstep(0.0, r, r - length(u))
+
+in vec2 fragCoord;
+out vec4 fragColor;
+
+uniform float bars[512];
+
+uniform int bars_count;    // number of bars (left + right) (configurable)
+uniform float shader_time; // shader execution time s
+uniform int bar_width;     // bar width (configurable), not used here
+uniform int bar_spacing;   // space bewteen bars (configurable)
+
+uniform vec3 u_resolution; // window resolution
+
+// colors, configurable in cava config file (r,g,b) (0.0 - 1.0)
+uniform vec3 bg_color; // background color
+uniform vec3 fg_color; // foreground color
+
+uniform int gradient_count;
+uniform vec3 gradient_colors[8]; // gradient colors
+
+// gradient map ( color, equation, time, width, shadow, reciprocal )
+vec3 gm(vec3 c, float n, float t, float w, float d, bool i) {
+  float g = min(abs(n), 1.0 / abs(n));
+  float s = abs(sin(n * PI - t));
+  if (i)
+    s = min(s, abs(sin(PI / n + t)));
+  return (1.0 - pow(abs(s), w)) * c * pow(g, d) * 6.0;
+}
+
+// denominator spiral, use 1/n for numerator
+// ( screen xy, spiral exponent, decimal, line width, hardness, rotation )
+float ds(vec2 u, float e, float n, float w, float h, float ro) {
+  float ur = length(u);          // unit radius
+  float sr = pow(ur, e);         // spiral radius
+  float a = round(sr) * n * TAU; // arc
+  vec2 xy = CS(a + ro) * ur;     // xy coords
+  float l = PT(u - xy, w);       // line
+  float s = mod(sr + 0.5, 1.0);  // gradient smooth
+  s = min(s, 1.0 - s);           // darken filter
+  return l * s * h;
+}
+
+void main() {
+  float t = shader_time / PI * 2.0;
+  vec4 m = vec4(0, 0, 0, 0);                 // iMouse;
+  m.xy = m.xy * 2.0 / u_resolution.xy - 1.0; // ±1x, ±1y
+  if (m.z > 0.0)
+    t += m.y * SCALE; // move time with mouse y
+  float z = (m.z > 0.0) ? pow(1.0 - abs(m.y), sign(m.y)) : 1.0; // zoom (+)
+  float e = (m.z > 0.0) ? pow(1.0 - abs(m.x), -sign(m.x))
+                        : 1.0;                   // screen exponent (+)
+  float se = (m.z > 0.0) ? e * -sign(m.y) : 1.0; // spiral exponent
+  vec3 bg = vec3(0);                             // black background
+
+  float aa = 3.0; // anti-aliasing
+
+  for (float j = 0.0; j < aa; j++)
+    for (float k = 0.0; k < aa; k++) {
+      vec3 c = vec3(0);
+      vec2 o = vec2(j, k) / aa;
+      vec2 uv = (fragCoord * u_resolution.xy - 0.5 * u_resolution.xy + o) /
+                u_resolution.y * SCALE * z; // apply cartesian, scale and zoom
+      if (m.z > 0.0)
+        uv =
+            exp(log(abs(uv)) * e) * sign(uv); // warp screen space with exponent
+
+      float px = length(fwidth(uv)); // pixel width
+      float x = uv.x;                // every pixel on x
+      float y = uv.y;                // every pixel on y
+      float l = length(uv);          // hypot of xy: sqrt(x*x+y*y)
+
+      float mc = (x * x + y * y - 1.0) / y;  // metallic circle at xy
+      float g = min(abs(mc), 1.0 / abs(mc)); // gradient
+      vec3 gold = vec3(1.0, 0.6, 0.0) * g * l;
+      vec3 blue = vec3(0.3, 0.5, 0.9) * (1.0 - g);
+      vec3 rgb = max(gold, blue);
+
+      float w = 0.1;                                      // line width
+      float d = 0.4;                                      // shadow depth
+      c = max(c, gm(rgb, mc, -t, w * bars[0], d, false)); // metallic
+      c = max(c, gm(rgb, abs(y / x) * sign(y), -t, w * bars[1], d,
+                    false)); // tangent
+      c = max(c, gm(rgb, (x * x) / (y * y) * sign(y), -t, w * bars[2], d,
+                    false)); // sqrt cotangent
+      c = max(c, gm(rgb, (x * x) + (y * y), t, w * bars[3], d,
+                    true)); // sqrt circles
+
+      c += rgb * ds(uv, se, t / TAU, px * 2.0 * bars[4], 2.0, 0.0); // spiral 1a
+      c += rgb * ds(uv, se, t / TAU, px * 2.0 * bars[5], 2.0, PI);  // spiral 1b
+      c +=
+          rgb * ds(uv, -se, t / TAU, px * 2.0 * bars[6], 2.0, 0.0); // spiral 2a
+      c += rgb * ds(uv, -se, t / TAU, px * 2.0 * bars[7], 2.0, PI); // spiral 2b
+      c = max(c, 0.0); // clear negative color
+
+      c += pow(max(1.0 - l, 0.0), 3.0 / z); // center glow
+
+      if (m.z > 0.0) // display grid on click
+      {
+        vec2 xyg = abs(fract(uv + 0.5) - 0.5) / px; // xy grid
+        c.gb += 0.2 * (1.0 - min(min(xyg.x, xyg.y), 1.0));
+      }
+      bg += c;
+    }
+  bg /= aa * aa;
+  bg *= sqrt(bg) * 1.5;
+
+  fragColor = vec4(bg, 1.0);
+}--- ./dotfiles/cava/shaders/northern_lights.frag ---
+#version 330
+
+in vec2 fragCoord;
+out vec4 fragColor;
+
+// bar values. defaults to left channels first (low to high), then right (high to low).
+uniform float bars[512];
+
+uniform int bars_count;    // number of bars (left + right) (configurable)
+
+uniform vec3 u_resolution; // window resolution, not used here
+
+//colors, configurable in cava config file
+uniform vec3 bg_color; // background color(r,g,b) (0.0 - 1.0), not used here
+uniform vec3 fg_color; // foreground color, not used here
+
+void main()
+{
+    // find which bar to use based on where we are on the x axis
+    int bar = int(bars_count * fragCoord.x);
+
+    float bar_y = 1.0 - abs((fragCoord.y - 0.5)) * 2.0;
+    float y = (bars[bar]) * bar_y;
+
+    float bar_x = (fragCoord.x - float(bar) / float(bars_count)) * bars_count;
+    float bar_r = 1.0 - abs((bar_x - 0.5)) * 2;
+
+    bar_r = bar_r * bar_r * 2;
+
+    // set color
+    fragColor.r = fg_color.x * y * bar_r;
+    fragColor.g = fg_color.y * y * bar_r;
+    fragColor.b = fg_color.z * y * bar_r;
+}
+--- ./dotfiles/cava/shaders/pass_through.vert ---
+#version 330
+
+
+// Input vertex data, different for all executions of this shader.
+layout(location = 0) in vec3 vertexPosition_modelspace;
+
+// Output data ; will be interpolated for each fragment.
+out vec2 fragCoord;
+
+void main()
+{
+    gl_Position =  vec4(vertexPosition_modelspace,1);
+    fragCoord  = (vertexPosition_modelspace.xy+vec2(1,1))/2.0;
+}
+--- ./dotfiles/cava/shaders/spectrogram.frag ---
+#version 330
+
+in vec2 fragCoord;
+out vec4 fragColor;
+
+// bar values. defaults to left channels first (low to high), then right (high
+// to low).
+uniform float bars[512];
+
+uniform int bars_count;  // number of bars (left + right) (configurable)
+uniform int bar_width;   // bar width (configurable), not used here
+uniform int bar_spacing; // space bewteen bars (configurable)
+
+uniform vec3 u_resolution; // window resolution
+
+// colors, configurable in cava config file (r,g,b) (0.0 - 1.0)
+uniform vec3 bg_color; // background color
+uniform vec3 fg_color; // foreground color
+
+uniform int gradient_count;
+uniform vec3 gradient_colors[8]; // gradient colors
+
+uniform sampler2D inputTexture; // Texture from the last render pass
+
+vec3 normalize_C(float y, vec3 col_1, vec3 col_2, float y_min, float y_max) {
+    // create color based on fraction of this color and next color
+    float yr = (y - y_min) / (y_max - y_min);
+    return col_1 * (1.0 - yr) + col_2 * yr;
+}
+
+void main() {
+    // find which bar to use based on where we are on the y axis
+    int bar = int(bars_count * fragCoord.y);
+    float y = bars[bar];
+    float band_size = 1.0 / float(bars_count);
+    float current_band_min = bar * band_size;
+    float current_band_max = (bar + 1) * band_size;
+
+    int hist_length = 512;
+    float win_size = 1.0 / hist_length;
+
+    if (fragCoord.x > 1.0 - win_size) {
+
+        if (fragCoord.y > current_band_min && fragCoord.y < current_band_max) {
+
+            fragColor = vec4(fg_color * y, 1.0);
+        }
+    } else {
+        vec2 offsetCoord = fragCoord;
+        offsetCoord.x += float(win_size);
+        fragColor = texture(inputTexture, offsetCoord);
+    }
+}--- ./dotfiles/cava/shaders/winamp_line_style_spectrum.frag ---
+#version 330
+
+// Emulate the "line style" spectrum analyzer from Winamp 2.
+// Try this config for a demonstration:
+
+/*
+[general]
+bar_width = 2
+bar_spacing = 0
+higher_cutoff_freq = 22000
+
+[output]
+method = sdl_glsl
+channels = mono
+fragment_shader = winamp_line_style_spectrum.frag
+
+[color]
+background = '#000000'
+gradient = 1
+gradient_color_1 = '#319C08'
+gradient_color_2 = '#29CE10'
+gradient_color_3 = '#BDDE29'
+gradient_color_4 = '#DEA518'
+gradient_color_5 = '#D66600'
+gradient_color_6 = '#CE2910'
+
+[smoothing]
+noise_reduction = 10
+*/
+
+in vec2 fragCoord;
+out vec4 fragColor;
+
+// bar values. defaults to left channels first (low to high), then right (high to low).
+uniform float bars[512];
+
+uniform int bars_count;    // number of bars (left + right) (configurable)
+uniform int bar_width;    // bar width (configurable), not used here
+uniform int bar_spacing;    // space bewteen bars (configurable)
+
+uniform vec3 u_resolution; // window resolution
+
+//colors, configurable in cava config file (r,g,b) (0.0 - 1.0)
+uniform vec3 bg_color; // background color
+uniform vec3 fg_color; // foreground color
+
+uniform int gradient_count;
+uniform vec3 gradient_colors[8]; // gradient colors
+
+vec3 normalize_C(float y,vec3 col_1, vec3 col_2, float y_min, float y_max)
+{
+    //create color based on fraction of this color and next color
+    float yr = (y - y_min) / (y_max - y_min);
+    return col_1 * (1.0 - yr) + col_2 * yr;
+}
+
+void main()
+{
+    // find which bar to use based on where we are on the x axis
+    float x = u_resolution.x * fragCoord.x;
+    int bar = int(bars_count * fragCoord.x);
+
+    //calculate a bar size
+    float bar_size = u_resolution.x / bars_count;
+
+    //the y coordinate is stretched by 4X to resemble Winamp
+    float y =  min(bars[bar] * 4.0, 1.0);
+
+    // make sure there is a thin line at bottom
+    if (y * u_resolution.y < 1.0)
+    {
+      y = 1.0 / u_resolution.y;
+    }
+
+    vec4 bar_color;
+
+    if (gradient_count == 0)
+    {
+        bar_color = vec4(fg_color,1.0);
+    }
+    else
+    {
+        //find color in the configured gradient for the top of the bar
+        int color = int((gradient_count - 1) * y);
+
+        //find where on y this and next color is supposed to be
+        float y_min = float(color) / (gradient_count - 1.0);
+        float y_max = float(color + 1) / (gradient_count - 1.0);
+
+        //make a solid color for the entire bar
+        bar_color = vec4(normalize_C(y, gradient_colors[color], gradient_colors[color + 1], y_min, y_max), 1.0);
+    }
+
+
+    //draw the bar up to current height
+    if (y > fragCoord.y)
+    {
+        //make some space between bars based on settings
+        if (x > (bar + 1) * (bar_size) - bar_spacing)
+        {
+            fragColor = vec4(bg_color,1.0);
+        }
+        else
+        {
+            fragColor = bar_color;
+        }
+    }
+    else
+    {
+        fragColor = vec4(bg_color,1.0);
+    }
+}--- ./dotfiles/cava/themes/solarized_dark ---
+[color]
+background = '#001e26'
+foreground = '#708183'
+
+gradient = 1
+gradient_color_1 = '#268bd2'
+gradient_color_2 = '#6c71c4'
+gradient_color_3 = '#cb4b16'
+
+horizontal_gradient = 1
+horizontal_gradient_color_1 = '#586e75'
+horizontal_gradient_color_2 = '#b58900'
+horizontal_gradient_color_3 = '#839496'
+
+blend_direction = 'up'--- ./dotfiles/cava/themes/tricolor ---
+[color]
+horizontal_gradient = 1
+horizontal_gradient_color_1 = '#c45161'
+horizontal_gradient_color_2 = '#e094a0'
+horizontal_gradient_color_3 = '#f2b6c0'
+horizontal_gradient_color_4 = '#f2dde1'
+horizontal_gradient_color_5 = '#cbc7d8'
+horizontal_gradient_color_6 = '#8db7d2'
+horizontal_gradient_color_7 = '#5e62a9'
+horizontal_gradient_color_8 = '#434279'--- ./dotfiles/fastfetch/ascii/rose.txt ---
+       _,--._.-,
+      /\_/-,\_ )
+   .-.) _;=='_/ (.;
+    \ \'      \/= )
+     -\.'-. __.'|-'
+    <_`-'\'__.'/
+      `'-._( \
+       ___   \\\,      ___
+       \ .'-. \\\   .-'_. /
+        '._' '.\\\/.-'_.'
+           '--``\\('--'
+                 \\\
+                 `\\\
+                   \\|
+--- ./dotfiles/fastfetch/config.jsonc ---
+//   _____ _____ _____ _____ _____ _____ _____ _____ _____ 
+//  |   __|  _  |   __|_   _|   __|   __|_   _|     |  |  |
+//  |   __|     |__   | | | |   __|   __| | | |   --|     |
+//  |__|  |__|__|_____| |_| |__|  |_____| |_| |_____|__|__|
+//
+//  by Bina
+
+
+// execute with: fastfetch --colors-block-range-start 9 --colors-block-width 3
+
+{
+    "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+    "logo": {
+        "source": "~/.config/fastfetch/ascii/rose.txt",
+        "padding": {
+            "top": 2,
+            "right": 6
+        }
+    },
+    "display": {
+        "separator": " "
+    },
+    "modules": [
+	"break",
+	"break",
+	{
+            "type": "title",
+            "keyWidth": 10
+        },
+        "break",
+        {
+            "type": "os",
+            "key": " ",
+            "keyColor": "33",  // = color3
+        },
+        {
+            "type": "kernel",
+            "key": " ",
+            "keyColor": "33",
+        },
+        {
+            "type": "packages",
+            "format": "{} (pacman)",
+            "key": " ",
+            "keyColor": "33",  
+        },
+        {
+            "type": "shell",
+            "key": " ",
+            "keyColor": "33", 
+        },
+        {
+            "type": "terminal",
+            "key": " ",
+            "keyColor": "33", 
+        },
+        {
+            "type": "wm",
+            "key": " ",
+            "keyColor": "33", 
+        },
+        {
+            "type": "uptime",
+            "key": " ",
+            "keyColor": "33", 
+        },
+        {
+            "type": "media",
+            "key": "󰝚 ",
+            "keyColor": "33", 
+        },
+        "break",
+        "colors",
+        "break",
+        "break",
+    ]
+}
+--- ./dotfiles/fish/config.fish ---
+if status is-interactive
+    # Commands to run in interactive sessions can go here
+end
+
+# Custom uwu command
+
+# safe-arg-escaper (returns quoted args)
+function __escape_args
+    set -l out
+    for a in $argv
+        # replace single quotes with '"'"' safe sequence then wrap in single quotes
+        set a (string replace -a "'" "'\"'\"'" -- $a)
+        set out $out "'$a'"
+    end
+    echo (string join ' ' $out)
+end
+
+# update: default behavior pacman -Syu, but forwards any args to pacman
+function update
+    if test (count $argv) -gt 0
+        pacman $argv
+    else
+        pacman -Syu
+    end
+end
+
+# uwu: sudo wrapper that supports:
+# - no args -> interactive root shell
+# - "uwu install <pkg...>" -> sudo pacman -S <pkg...> (or if first arg after install starts with '-', run pacman with those flags)
+# - function invocation: serializes function and runs it under sudo fish -c "<def>\n<call>"
+# - otherwise forwards to sudo normally
+function uwu
+    if test (count $argv) -eq 0
+        # interactive root shell
+        command sudo -s
+        return
+    end
+
+    set -l first $argv[1]
+
+    # special-case: uwu install <...>
+    if test $first = 'install'
+        if test (count $argv) -eq 1
+            # no package -> do a full system upgrade
+            command sudo pacman -Syu
+            return
+        end
+
+        set -l rest $argv[2..-1]
+        # if the first of rest looks like an option (starts with -), treat as full pacman args
+        if string match -q -r '^-' $rest[1]
+            command sudo pacman $rest
+        else
+            command sudo pacman -S $rest
+        end
+        return
+    end
+
+    # if first arg is a fish function, serialize it and run under root's fish
+    if functions -q $first
+        # capture function definition as text
+        set -l fdef (functions $first)
+
+        # prepare remaining args (2..end) safely quoted
+        if test (count $argv) -gt 1
+            set -l rest (__escape_args $argv[2..-1])
+            set -l fullcmd "$fdef\n$first $rest"
+        else
+            set -l fullcmd "$fdef\n$first"
+        end
+
+        # run under sudo: root runs fish -c "<function-def + invocation>"
+        command sudo fish -c "$fullcmd"
+    else
+        # normal external command: forward to sudo
+        command sudo $argv
+    end
+end
+
+# optional: persist to ~/.config/fish/functions (funcsave)
+
+
+# -- Fastfetch -- #
+
+# ~/.config/fish/config.fish
+
+# Detect kitty as the terminal
+if test "$TERM" = "xterm-kitty"
+    # Run only if this is the first fish instance in this terminal session
+    if not set -q __fastfetch_ran
+        set -g __fastfetch_ran 1
+        fastfetch
+    end
+end
+--- ./dotfiles/fish/fish_variables ---
+# This file contains fish universal variable definitions.
+# VERSION: 3.0
+SETUVAR __fish_initialized:3800
+SETUVAR fish_color_autosuggestion:brblack
+SETUVAR fish_color_cancel:\x2dr
+SETUVAR fish_color_command:normal
+SETUVAR fish_color_comment:red
+SETUVAR fish_color_cwd:green
+SETUVAR fish_color_cwd_root:red
+SETUVAR fish_color_end:green
+SETUVAR fish_color_error:brred
+SETUVAR fish_color_escape:brcyan
+SETUVAR fish_color_history_current:\x2d\x2dbold
+SETUVAR fish_color_host:normal
+SETUVAR fish_color_host_remote:yellow
+SETUVAR fish_color_normal:normal
+SETUVAR fish_color_operator:brcyan
+SETUVAR fish_color_param:cyan
+SETUVAR fish_color_quote:yellow
+SETUVAR fish_color_redirection:cyan\x1e\x2d\x2dbold
+SETUVAR fish_color_search_match:white\x1e\x2d\x2dbackground\x3dbrblack\x1e\x2d\x2dbold
+SETUVAR fish_color_selection:white\x1e\x2d\x2dbackground\x3dbrblack\x1e\x2d\x2dbold
+SETUVAR fish_color_status:red
+SETUVAR fish_color_user:brgreen
+SETUVAR fish_color_valid_path:\x2d\x2dunderline
+SETUVAR fish_key_bindings:fish_default_key_bindings
+SETUVAR fish_pager_color_background:\x1d
+SETUVAR fish_pager_color_completion:normal
+SETUVAR fish_pager_color_description:yellow\x1e\x2di
+SETUVAR fish_pager_color_prefix:normal\x1e\x2d\x2dbold\x1e\x2d\x2dunderline
+SETUVAR fish_pager_color_progress:brwhite\x1e\x2d\x2dbackground\x3dcyan\x1e\x2d\x2dbold
+SETUVAR fish_pager_color_secondary_background:\x1d
+SETUVAR fish_pager_color_secondary_completion:\x1d
+SETUVAR fish_pager_color_secondary_description:\x1d
+SETUVAR fish_pager_color_secondary_prefix:\x1d
+SETUVAR fish_pager_color_selected_background:\x2dr
+SETUVAR fish_pager_color_selected_completion:\x1d
+SETUVAR fish_pager_color_selected_description:\x1d
+SETUVAR fish_pager_color_selected_prefix:\x1d
+--- ./dotfiles/fish/functions/__escape_args.fish ---
+function __escape_args
+    set -l out
+    for a in $argv
+        # replace single quotes with '"'"' safe sequence then wrap in single quotes
+        set a (string replace -a "'" "'\"'\"'" -- $a)
+        set out $out "'$a'"
+    end
+    echo (string join ' ' $out)
+end
+--- ./dotfiles/fish/functions/fish_greeting.fish ---
+--- ./dotfiles/fish/functions/fish_prompt.fish ---
+function fish_prompt
+    starship prompt
+end
+--- ./dotfiles/fish/functions/update.fish ---
+function update
+    if test (count $argv) -gt 0
+        pacman $argv
+    else
+        pacman -Syu
+    end
+end
+--- ./dotfiles/fish/functions/uwu.fish ---
+function uwu
+    if test (count $argv) -eq 0
+        # interactive root shell
+        command sudo -s
+        return
+    end
+
+    set -l first $argv[1]
+
+    # special-case: uwu install <...>
+    if test $first = 'install'
+        if test (count $argv) -eq 1
+            # no package -> do a full system upgrade
+            command sudo pacman -Syu
+            return
+        end
+
+        set -l rest $argv[2..-1]
+        # if the first of rest looks like an option (starts with -), treat as full pacman args
+        if string match -q -r '^-' $rest[1]
+            command sudo pacman $rest
+        else
+            command sudo pacman -S $rest
+        end
+        return
+    end
+
+    # if first arg is a fish function, serialize it and run under root's fish
+    if functions -q $first
+        # capture function definition as text
+        set -l fdef (functions $first)
+
+        # prepare remaining args (2..end) safely quoted
+        if test (count $argv) -gt 1
+            set -l rest (__escape_args $argv[2..-1])
+            set -l fullcmd "$fdef\n$first $rest"
+        else
+            set -l fullcmd "$fdef\n$first"
+        end
+
+        # run under sudo: root runs fish -c "<function-def + invocation>"
+        command sudo fish -c "$fullcmd"
+    else
+        # normal external command: forward to sudo
+        command sudo $argv
+    end
+end
+--- ./dotfiles/hypr/hyprland.conf ---
+
+
+
+# This config is unified. Means it is combined file. and you may append your Decorations and windowrules and etc in their
+# respected place in this file.
+
+
+# Refer to the wiki for more information.
+# https://wiki.hypr.land/Configuring/
+
+# Please note not all available settings / options are set here.
+# For a full list, see the wiki
+
+# You can split this configuration into multiple files
+# Create your files separately and then link them to this file like this:
+# source = ~/.config/hypr/myColors.conf
+
+
+################
+### MONITORS ###
+################
+
+# See https://wiki.hypr.land/Configuring/Monitors/
+monitor=,preferred,auto,1
+
+
+###################
+### MY PROGRAMS ###
+###################
+
+# See https://wiki.hypr.land/Configuring/Keywords/
+
+# Set programs that you use
+$terminal = kitty
+$fileManager = thunar
+$menu = rofi -show drun
+
+
+#################
+### AUTOSTART ###
+#################
+
+# Autostart necessary processes (like notifications daemons, status bars, etc.)
+# Or execute your favorite apps at launch like this:
+
+# exec-once = $terminal
+# exec-once = nm-applet &
+# exec-once = waybar & hyprpaper & firefox
+exec-once = waybar & mpvpaper eDP-1 /home/cran/Pictures/Wallpaper/video.mp4
+
+#############################
+### ENVIRONMENT VARIABLES ###
+#############################
+
+# See https://wiki.hypr.land/Configuring/Environment-variables/
+
+env = XCURSOR_SIZE,18
+env = HYPRCURSOR_SIZE,18
+
+
+###################
+### PERMISSIONS ###
+###################
+
+# See https://wiki.hypr.land/Configuring/Permissions/
+# Please note permission changes here require a Hyprland restart and are not applied on-the-fly
+# for security reasons
+
+# ecosystem {
+#   enforce_permissions = 1
+# }
+
+# permission = /usr/(bin|local/bin)/grim, screencopy, allow
+# permission = /usr/(lib|libexec|lib64)/xdg-desktop-portal-hyprland, screencopy, allow
+# permission = /usr/(bin|local/bin)/hyprpm, plugin, allow
+
+
+#####################
+### LOOK AND FEEL ###
+#####################
+
+# Refer to https://wiki.hypr.land/Configuring/Variables/
+
+# https://wiki.hypr.land/Configuring/Variables/#general
+general {
+    gaps_in = 1
+    gaps_out = 3
+
+    border_size = 0
+
+    # https://wiki.hypr.land/Configuring/Variables/#variable-types for info about colors
+    col.active_border = rgba(33ccffee) rgba(00ff99ee) 45deg
+    col.inactive_border = rgba(595959aa)
+
+    # Set to true enable resizing windows by clicking and dragging on borders and gaps
+    resize_on_border = false
+
+    # Please see https://wiki.hypr.land/Configuring/Tearing/ before you turn this on
+    allow_tearing = false
+
+    layout = dwindle
+}
+
+# https://wiki.hypr.land/Configuring/Variables/#decoration
+decoration {
+    rounding = 1
+    rounding_power = 2
+
+    # Change transparency of focused and unfocused windows
+    active_opacity = 1.0
+    inactive_opacity = 0.8
+
+    shadow {
+        enabled = true
+        range = 4
+        render_power = 3
+        color = rgba(1a1a1aee)
+    }
+
+    # https://wiki.hypr.land/Configuring/Variables/#blur
+    blur {
+        enabled = true
+        size = 3
+        passes = 1
+
+        vibrancy = 0.1696
+    }
+}
+
+# https://wiki.hypr.land/Configuring/Variables/#animations
+animations {
+    enabled = yes, please :)
+
+    # Default curves, see https://wiki.hypr.land/Configuring/Animations/#curves
+    #        NAME,           X0,   Y0,   X1,   Y1
+    bezier = easeOutQuint,   0.23, 1,    0.32, 1
+    bezier = easeInOutCubic, 0.65, 0.05, 0.36, 1
+    bezier = linear,         0,    0,    1,    1
+    bezier = almostLinear,   0.5,  0.5,  0.75, 1
+    bezier = quick,          0.15, 0,    0.1,  1
+
+    # Default animations, see https://wiki.hypr.land/Configuring/Animations/
+    #           NAME,          ONOFF, SPEED, CURVE,        [STYLE]
+    animation = global,        1,     10,    default
+    animation = border,        1,     5.39,  easeOutQuint
+    animation = windows,       1,     4.79,  easeOutQuint
+    animation = windowsIn,     1,     4.1,   easeOutQuint, popin 87%
+    animation = windowsOut,    1,     1.49,  linear,       popin 87%
+    animation = fadeIn,        1,     1.73,  almostLinear
+    animation = fadeOut,       1,     1.46,  almostLinear
+    animation = fade,          1,     3.03,  quick
+    animation = layers,        1,     3.81,  easeOutQuint
+    animation = layersIn,      1,     4,     easeOutQuint, fade
+    animation = layersOut,     1,     1.5,   linear,       fade
+    animation = fadeLayersIn,  1,     1.79,  almostLinear
+    animation = fadeLayersOut, 1,     1.39,  almostLinear
+    animation = workspaces,    1,     1.94,  almostLinear, fade
+    animation = workspacesIn,  1,     1.21,  almostLinear, fade
+    animation = workspacesOut, 1,     1.94,  almostLinear, fade
+    animation = zoomFactor,    1,     7,     quick
+}
+
+# Ref https://wiki.hypr.land/Configuring/Workspace-Rules/
+# "Smart gaps" / "No gaps when only"
+# uncomment all if you wish to use that.
+# workspace = w[tv1], gapsout:0, gapsin:0
+# workspace = f[1], gapsout:0, gapsin:0
+# windowrule = bordersize 0, floating:0, onworkspace:w[tv1]
+# windowrule = rounding 0, floating:0, onworkspace:w[tv1]
+# windowrule = bordersize 0, floating:0, onworkspace:f[1]
+# windowrule = rounding 0, floating:0, onworkspace:f[1]
+
+# See https://wiki.hypr.land/Configuring/Dwindle-Layout/ for more
+dwindle {
+    pseudotile = true # Master switch for pseudotiling. Enabling is bound to mainMod + P in the keybinds section below
+    preserve_split = true # You probably want this
+}
+
+# See https://wiki.hypr.land/Configuring/Master-Layout/ for more
+master {
+    new_status = master
+}
+
+# https://wiki.hypr.land/Configuring/Variables/#misc
+misc {
+    force_default_wallpaper = -1 # Set to 0 or 1 to disable the anime mascot wallpapers
+    disable_hyprland_logo = false # If true disables the random hyprland logo / anime girl background. :(
+}
+
+
+#############
+### INPUT ###
+#############
+
+# https://wiki.hypr.land/Configuring/Variables/#input
+input {
+    kb_layout = us
+    kb_variant =
+    kb_model =
+    kb_options =
+    kb_rules =
+
+    follow_mouse = 1
+    accel_profile = flat
+    sensitivity = 0 # -1.0 - 1.0, 0 means no modification.
+
+    touchpad {
+        natural_scroll = false
+    }
+}
+
+# See https://wiki.hypr.land/Configuring/Gestures
+gesture = 3, horizontal, workspace
+
+# Example per-device config
+# See https://wiki.hypr.land/Configuring/Keywords/#per-device-input-configs for more
+device {
+    name = epic-mouse-v1
+    sensitivity = -0.5
+}
+
+
+###################
+### KEYBINDINGS ###
+###################
+
+# See https://wiki.hypr.land/Configuring/Keywords/
+$mainMod = SUPER # Sets "Windows" key as main modifier
+
+# Example binds, see https://wiki.hypr.land/Configuring/Binds/ for more
+bind = $mainMod, T, exec, $terminal
+bind = $mainMod, Q, killactive,
+bind = $mainMod, M, exit,
+bind = $mainMod, E, exec, $fileManager
+bind = $mainMod, W, togglefloating,
+bind = $mainMod, A, exec, $menu
+bind = $mainMod, P, pseudo, # dwindle
+bind = $mainMod, J, togglesplit, # dwindle
+bind = $mainMod, B, exec, zen
+bind = $mainMod, L, exec, wlogout
+bind = $mainMod, D, exec, discord --enable-features=WaylandWindowDecorations --ozone-platform-hint=auto
+bind = $mainMod, C, exec, code --enable-features=WaylandWindowDecorations --ozone-platform-hint=auto
+bind = , Print, exec, grim -g "$(slurp)" ~/Pictures/Screenshots/$(date +%Y-%m-%d_%H-%M-%S).png
+
+# Move focus with mainMod + arrow keys
+bind = $mainMod, left, movefocus, l
+bind = $mainMod, right, movefocus, r
+bind = $mainMod, up, movefocus, u
+bind = $mainMod, down, movefocus, d
+
+# Switch workspaces with mainMod + [0-9]
+bind = $mainMod, 1, workspace, 1
+bind = $mainMod, 2, workspace, 2
+bind = $mainMod, 3, workspace, 3
+bind = $mainMod, 4, workspace, 4
+bind = $mainMod, 5, workspace, 5
+bind = $mainMod, 6, workspace, 6
+bind = $mainMod, 7, workspace, 7
+bind = $mainMod, 8, workspace, 8
+bind = $mainMod, 9, workspace, 9
+bind = $mainMod, 0, workspace, 10
+
+# Move active window to a workspace with mainMod + SHIFT + [0-9]
+bind = $mainMod SHIFT, 1, movetoworkspace, 1
+bind = $mainMod SHIFT, 2, movetoworkspace, 2
+bind = $mainMod SHIFT, 3, movetoworkspace, 3
+bind = $mainMod SHIFT, 4, movetoworkspace, 4
+bind = $mainMod SHIFT, 5, movetoworkspace, 5
+bind = $mainMod SHIFT, 6, movetoworkspace, 6
+bind = $mainMod SHIFT, 7, movetoworkspace, 7
+bind = $mainMod SHIFT, 8, movetoworkspace, 8
+bind = $mainMod SHIFT, 9, movetoworkspace, 9
+bind = $mainMod SHIFT, 0, movetoworkspace, 10
+
+# Example special workspace (scratchpad)
+bind = $mainMod, S, togglespecialworkspace, magic
+bind = $mainMod SHIFT, S, movetoworkspace, special:magic
+
+# Scroll through existing workspaces with mainMod + scroll
+bind = $mainMod, mouse_down, workspace, e+1
+bind = $mainMod, mouse_up, workspace, e-1
+
+# Move/resize windows with mainMod + LMB/RMB and dragging
+bindm = $mainMod, mouse:272, movewindow
+bindm = $mainMod, mouse:273, resizewindow
+
+# Laptop multimedia keys for volume and LCD brightness
+bindel = ,XF86AudioRaiseVolume, exec, wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+
+bindel = ,XF86AudioLowerVolume, exec, wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
+bindel = ,XF86AudioMute, exec, wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+bindel = ,XF86AudioMicMute, exec, wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle
+bindel = ,XF86MonBrightnessUp, exec, brightnessctl -e4 -n2 set 5%+
+bindel = ,XF86MonBrightnessDown, exec, brightnessctl -e4 -n2 set 5%-
+
+# Requires playerctl
+bindl = , XF86AudioNext, exec, playerctl next
+bindl = , XF86AudioPause, exec, playerctl play-pause
+bindl = , XF86AudioPlay, exec, playerctl play-pause
+bindl = , XF86AudioPrev, exec, playerctl previous
+
+##############################
+### WINDOWS AND WORKSPACES ###
+##############################
+
+# See https://wiki.hypr.land/Configuring/Window-Rules/ for more
+# See https://wiki.hypr.land/Configuring/Workspace-Rules/ for workspace rules
+
+# Example windowrule
+# windowrule = float,class:^(kitty)$,title:^(kitty)$
+
+# Ignore maximize requests from apps. You'll probably like this.
+windowrule = suppressevent maximize, class:.*
+
+# Fix some dragging issues with XWayland
+windowrule = nofocus,class:^$,title:^$,xwayland:1,floating:1,fullscreen:0,pinned:0
+
+# ---- CUSTOM WINDOWRULES ---- #
+
+# See https://wiki.hyprland.org/Configuring/Window-Rules/ for more
+# See https://wiki.hyprland.org/Configuring/Workspace-Rules/ for workspace rules
+
+#------- WINDOW RULES -------#
+
+# Ignore fullscreen/maximize requests from apps. You'll probably like this.
+windowrulev2 = suppressevent fullscreen, class:.*
+windowrulev2 = suppressevent maximize, class:.*
+
+# Fix some dragging issues with XWayland
+windowrulev2 = nofocus,class:^$,title:^$,xwayland:1,floating:1,fullscreen:0,pinned:0
+
+# Wine, x64 and steam_app_ border colors.
+#windowrule = bordercolor rgba(ff4040ff), class:^(.*\.exe)$      # Wine
+#windowrule = bordercolor rgba(ff7070ff), class:^steam_app_.*$   # Native
+#windowrule = bordercolor rgba(ff7070ff), class:^(.*\.x86_64)$   # Native
+
+# Send them to...
+windowrulev2 = workspace 10 silent, class:^(.*\.exe)$
+windowrulev2 = workspace 10 silent, class:^steam_app_.*$
+windowrulev2 = workspace 10 silent, class:^(.*\.x86_64)$
+
+# Auto center them
+windowrulev2 = centerwindow, class:^(.*\.exe)$
+windowrulev2 = centerwindow, class:^steam_app_.*$
+windowrulev2 = centerwindow, class:^(.*\.x86_64)$
+
+# Auto float and resize
+windowrulev2 = float, title:^(Pipewire Volume Control)$
+windowrulev2 = size 1200 1024, title:^(Pipewire Volume Control)$
+windowrulev2 = float, title:^(iwgtk)$
+windowrulev2 = float, class:^(iwgtk)$
+windowrulev2 = size 1200 1024, title:^(iwgtk)$
+windowrulev2 = float, class:^(com.github.hluk.copyq)$
+windowrulev2 = size 768 1024, class:^(com.github.hluk.copyq)$
+windowrulev2 = float, title:^(Dummy manual)$
+windowrulev2 = size 640 768, title:^(Dummy manual)$
+windowrulev2 = float, class:^(chrome-calendar.google.com__-Default)$
+windowrulev2 = size 1280 768, class:^(chrome-calendar.google.com__-Default)$
+windowrulev2 = float, class:^(nwg-displays)$
+windowrulev2 = size 1080 768, class:^(nwg-displays)$
+windowrulev2 = float, title:^(Monitor config)$
+windowrulev2 = size 786 480, title:^(Monitor config)$
+windowrulev2 = float, title:^(Pacman)$
+windowrulev2 = size 870 768, title:^(Pacman)$
+windowrulev2 = float, title:^(qalc_floating)$
+windowrulev2 = size 840 768, title:^(qalc_floating)$
+windowrulev2 = float, title:^(zellij_floating)$
+windowrulev2 = size 1280 1024, title:^(zellij_floating)$
+
+windowrulev2 = float, class:showmethekey-gtk
+windowrulev2 = size 768 144, class:showmethekey-gtk
+windowrulev2 = pin, class:showmethekey-gtk
+
+#windowrule = opacity 0.9 override 0.9 override 1.0 override, class:.*
+windowrulev2=bordercolor rgb(cba6f7),fullscreen:1
+#windowrulev2=bordersize 4,fullscreen:1
+
+windowrulev2 = maximize, title:satty
+windowrulev2 = float, title:satty
+windowrulev2 = size 1280 768, title:satty
+windowrulev2 = centerwindow, title:nsxiv
+
+windowrulev2 = workspace name:lock silent, title:lock_bg
+windowrulev2 = fullscreenstate 2, title:lock_bg
+windowrulev2 = noanim, title:lock_bg
+
+# windowrulev2 = dimaround, title:(Power Profiles)|(Power Options)
+windowrulev2 = dimaround, class:wofi
+
+windowrule = animation popin 100%, group:1
+
+workspace=special:magic,gapsin:24
+workspace=special:magic,gapsout:72
+
+windowrulev2 = group, class:^(kicad)$
+windowrulev2 = group, class:^(blender)$
+
+windowrulev2 = size 530 400, title:kitty
+windowrulev2 = float, title:kitty
+--- ./dotfiles/hypr/windowsrule.conf ---
+##############################
+### WINDOWS AND WORKSPACES ###
+##############################
+
+# Ignore fullscreen/maximize requests from apps. You'll probably like this.
+windowrulev2 = suppressevent fullscreen, class:.*
+windowrulev2 = suppressevent maximize, class:.*
+
+# Fix some dragging issues with XWayland
+windowrulev2 = nofocus,class:^$,title:^$,xwayland:1,floating:1,fullscreen:0,pinned:0
+
+# Wine, x64 and steam_app_ border colors.
+#windowrule = bordercolor rgba(ff4040ff), class:^(.*\.exe)$      # Wine
+#windowrule = bordercolor rgba(ff7070ff), class:^steam_app_.*$   # Native
+#windowrule = bordercolor rgba(ff7070ff), class:^(.*\.x86_64)$   # Native
+
+# Send them to...
+windowrulev2 = workspace 10 silent, class:^(.*\.exe)$
+windowrulev2 = workspace 10 silent, class:^steam_app_.*$
+windowrulev2 = workspace 10 silent, class:^(.*\.x86_64)$
+
+# Auto center them
+windowrulev2 = centerwindow, class:^(.*\.exe)$
+windowrulev2 = centerwindow, class:^steam_app_.*$
+windowrulev2 = centerwindow, class:^(.*\.x86_64)$
+
+# Auto float and resize
+windowrulev2 = float, title:^(Pipewire Volume Control)$
+windowrulev2 = size 1200 1024, title:^(Pipewire Volume Control)$
+windowrulev2 = float, title:^(iwgtk)$
+windowrulev2 = float, class:^(iwgtk)$
+windowrulev2 = size 1200 1024, title:^(iwgtk)$
+windowrulev2 = float, class:^(com.github.hluk.copyq)$
+windowrulev2 = size 768 1024, class:^(com.github.hluk.copyq)$
+windowrulev2 = float, title:^(Dummy manual)$
+windowrulev2 = size 640 768, title:^(Dummy manual)$
+windowrulev2 = float, class:^(chrome-calendar.google.com__-Default)$
+windowrulev2 = size 1280 768, class:^(chrome-calendar.google.com__-Default)$
+windowrulev2 = float, class:^(nwg-displays)$
+windowrulev2 = size 1080 768, class:^(nwg-displays)$
+windowrulev2 = float, title:^(Monitor config)$
+windowrulev2 = size 786 480, title:^(Monitor config)$
+windowrulev2 = float, title:^(Pacman)$
+windowrulev2 = size 870 768, title:^(Pacman)$
+windowrulev2 = float, title:^(qalc_floating)$
+windowrulev2 = size 840 768, title:^(qalc_floating)$
+windowrulev2 = float, title:^(zellij_floating)$
+windowrulev2 = size 1280 1024, title:^(zellij_floating)$
+
+windowrulev2 = float, class:showmethekey-gtk
+windowrulev2 = size 768 144, class:showmethekey-gtk
+windowrulev2 = pin, class:showmethekey-gtk
+
+#windowrule = opacity 0.9 override 0.9 override 1.0 override, class:.*
+windowrulev2=bordercolor rgb(cba6f7),fullscreen:1
+#windowrulev2=bordersize 4,fullscreen:1
+
+windowrulev2 = maximize, title:satty
+windowrulev2 = float, title:satty
+windowrulev2 = size 1280 768, title:satty
+windowrulev2 = centerwindow, title:nsxiv
+
+windowrulev2 = workspace name:lock silent, title:lock_bg
+windowrulev2 = fullscreenstate 2, title:lock_bg
+windowrulev2 = noanim, title:lock_bg
+
+# windowrulev2 = dimaround, title:(Power Profiles)|(Power Options)
+windowrulev2 = dimaround, class:wofi
+
+windowrule = animation popin 100%, group:1
+
+workspace=special:magic,gapsin:24
+workspace=special:magic,gapsout:72
+
+windowrulev2 = group, class:^(kicad)$
+windowrulev2 = group, class:^(blender)$
+
+windowrulev2 = size 530 400, title:kitty
+windowrulev2 = float, title:kitty
+--- ./dotfiles/kitty/kitty.conf ---
+font_family      JetBrainsMono Nerd Font
+bold_font        auto
+italic_font      auto
+bold_italic_font auto
+
+enable_audio_bell no
+font_size 9.0
+window_padding_width 25
+cursor_trail 1
+
+#window_padding_width 20
+include themes/theme.conf
+background_opacity 0.60
+#hide_window_decorations yes
+confirm_os_window_close 0
+--- ./dotfiles/kitty/themes/Rose-Pine.conf ---
+## name: Rosé Pine
+## author: mvllow
+## license: MIT
+## upstream: https://github.com/rose-pine/kitty/blob/main/dist/rose-pine.conf
+## blurb: All natural pine, faux fur and a bit of soho vibes for the classy minimalist
+
+foreground               #e0def4
+background               #191724
+selection_foreground     #e0def4
+selection_background     #403d52
+
+cursor                   #524f67
+cursor_text_color        #e0def4
+
+url_color                #c4a7e7
+
+active_tab_foreground    #e0def4
+active_tab_background    #26233a
+inactive_tab_foreground  #6e6a86
+inactive_tab_background  #191724
+
+active_border_color      #31748f
+inactive_border_color    #403d52
+
+# black
+color0   #26233a
+color8   #6e6a86
+
+# red
+color1   #eb6f92
+color9   #eb6f92
+
+# green
+color2   #31748f
+color10  #31748f
+
+# yellow
+color3   #f6c177
+color11  #f6c177
+
+# blue
+color4   #9ccfd8
+color12  #9ccfd8
+
+# magenta
+color5   #c4a7e7
+color13  #c4a7e7
+
+# cyan
+color6   #ebbcba
+color14  #ebbcba
+
+# white
+color7   #e0def4
+color15  #e0def4
+--- ./dotfiles/kitty/themes/Tokyo-Night.conf ---
+# Tokyo Night color scheme for kitty terminal emulator
+# https://github.com/davidmathers/tokyo-night-kitty-theme
+#
+# Based on Tokyo Night color theme for Visual Studio Code
+# https://github.com/enkia/tokyo-night-vscode-theme
+
+foreground #a9b1d6
+background #24283b
+
+# Black
+color0 #414868
+color8 #414868
+
+# Red
+color1 #f7768e
+color9 #f7768e
+
+# Green
+color2  #73daca
+color10 #73daca
+
+# Yellow
+color3  #e0af68
+color11 #e0af68
+
+# Blue
+color4  #7aa2f7
+color12 #7aa2f7
+
+# Magenta
+color5  #bb9af7
+color13 #bb9af7
+
+# Cyan
+color6  #7dcfff
+color14 #7dcfff
+
+# White
+color7  #c0caf5
+color15 #c0caf5
+
+# Cursor
+cursor #c0caf5
+cursor_text_color #1a1b26
+
+# Selection highlight
+selection_foreground none
+selection_background #28344a
+
+# The color for highlighting URLs on mouse-over
+url_color #9ece6a
+
+# Window borders
+active_border_color #3d59a1
+inactive_border_color #101014
+bell_border_color #e0af68
+
+# Tab bar
+tab_bar_style fade
+tab_fade 1
+active_tab_foreground   #3d59a1
+active_tab_background   #16161e
+active_tab_font_style   bold
+inactive_tab_foreground #787c99
+inactive_tab_background #16161e
+inactive_tab_font_style bold
+tab_bar_background #101014
+
+# Title bar
+macos_titlebar_color #16161e
+
+# Storm
+# background #24283b
+# cursor_text_color #24283b
+# active_tab_background   #1f2335
+# inactive_tab_background #1f2335
+# macos_titlebar_color #1f2335
+--- ./dotfiles/kitty/themes/theme.conf ---
+/home/kyokino/.config/kitty/themes/Wall-Dcol.conf
+--- ./dotfiles/Thunar/accels.scm ---
+; thunar GtkAccelMap rc-file         -*- scheme -*-
+; this file is an automated accelerator map dump
+;
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-by-type" "")
+; (gtk_accel_path "<Actions>/ThunarStatusBar/toggle-last-modified" "")
+; (gtk_accel_path "<Actions>/Thunarwindow/menu" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/cut" "<Primary>x")
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-by-size" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/file-menu" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/close-tab" "<Primary>w")
+; (gtk_accel_path "<Actions>/ThunarWindow/switch-previous-tab-alt" "<Primary><Shift>ISO_Left_Tab")
+; (gtk_accel_path "<Actions>/ThunarStatusBar/toggle-size" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/new-window" "<Primary>n")
+; (gtk_accel_path "<Actions>/ThunarWindow/clear-directory-specific-settings" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/close-window" "<Primary>q")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-parent" "<Alt>Up")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-side-pane-menu" "")
+; (gtk_accel_path "<Actions>/ThunarStatusBar/toggle-size-in-bytes" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/switch-previous-tab" "<Primary>Page_Up")
+; (gtk_accel_path "<Actions>/ThunarActionManager/open" "<Primary>o")
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-ascending" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/toggle-split-view" "F3")
+; (gtk_accel_path "<Actions>/ThunarActionManager/copy-2" "<Primary>Insert")
+; (gtk_accel_path "<Actions>/ThunarActionManager/trash-delete" "Delete")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-recent" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-configure-toolbar" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/forward" "<Alt>Right")
+; (gtk_accel_path "<Actions>/ThunarActionManager/restore" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-location-alt" "<Alt>d")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-out-alt" "<Primary>KP_Subtract")
+; (gtk_accel_path "<Actions>/ThunarStandardView/select-by-pattern" "<Primary>s")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-file-menu" "F10")
+; (gtk_accel_path "<Actions>/ThunarWindow/contents" "F1")
+; (gtk_accel_path "<Actions>/ThunarWindow/show-highlight" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-descending" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-by-name" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/select-all-files" "<Primary>a")
+; (gtk_accel_path "<Actions>/ThunarActionManager/execute" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/properties" "<Alt>Return")
+; (gtk_accel_path "<Actions>/ThunarActionManager/cut-2" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-by-dtime" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/switch-next-tab" "<Primary>Page_Down")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-templates" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/paste-2" "<Shift>Insert")
+; (gtk_accel_path "<Actions>/ThunarStatusBar/toggle-filetype" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/close-all-windows" "<Primary><Shift>w")
+; (gtk_accel_path "<Actions>/ThunarStandardView/create-document" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/detach-tab" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/cancel-search" "Escape")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-in-alt2" "<Primary>equal")
+; (gtk_accel_path "<Actions>/ThunarStatusBar/toggle-hidden-count" "")
+; (gtk_accel_path "<Actions>/ThunarShortcutsPane/sendto-shortcuts" "<Primary>d")
+; (gtk_accel_path "<Actions>/ThunarActionManager/undo" "<Primary>z")
+; (gtk_accel_path "<Actions>/ThunarStandardView/toggle-sort-order" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-location-selector-entry" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/paste" "<Primary>v")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-in-alt1" "<Primary>KP_Add")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-menubar" "<Primary>m")
+; (gtk_accel_path "<Actions>/ThunarStandardView/back" "<Alt>Left")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-desktop" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-as-detailed-list" "<Primary>2")
+; (gtk_accel_path "<Actions>/ThunarActionManager/restore-show" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/sendto-menu" "")
+; (gtk_accel_path "<Actions>/ThunarStatusBar/toggle-display-name" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/go-menu" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-out" "<Primary>minus")
+; (gtk_accel_path "<Actions>/ThunarWindow/remove-from-recent" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/open-with-other" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/invert-selection" "<Primary><Shift>i")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-side-pane-shortcuts" "<Primary>b")
+; (gtk_accel_path "<Actions>/ThunarWindow/reload-alt-2" "Reload")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-location-selector-menu" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/reload" "<Primary>r")
+; (gtk_accel_path "<Actions>/ThunarWindow/edit-menu" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/copy" "<Primary>c")
+; (gtk_accel_path "<Actions>/ThunarWindow/bookmarks-menu" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/forward-alt" "Forward")
+; (gtk_accel_path "<Actions>/ThunarActionManager/move-to-trash" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/reload-alt-1" "F5")
+; (gtk_accel_path "<Actions>/ThunarActionManager/delete-3" "<Shift>KP_Delete")
+; (gtk_accel_path "<Actions>/ThunarStandardView/unselect-all-files" "Escape")
+; (gtk_accel_path "<Actions>/ThunarWindow/contents/help-menu" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/arrange-items-menu" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/sort-by-mtime" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-computer" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/toggle-image-preview" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/toggle-side-pane" "F9")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-as-icons" "<Primary>1")
+; (gtk_accel_path "<Actions>/ThunarActionManager/delete-2" "<Shift>Delete")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-in" "<Primary>plus")
+; (gtk_accel_path "<Actions>/ThunarStandardView/rename" "F2")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-location" "<Primary>l")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-as-compact-list" "<Primary>3")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-menu" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/search" "<Primary>f")
+; (gtk_accel_path "<Actions>/ThunarWindow/new-tab" "<Primary>t")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-reset" "<Primary>0")
+; (gtk_accel_path "<Actions>/ThunarStandardView/back-alt2" "Back")
+; (gtk_accel_path "<Actions>/ThunarActionManager/open-in-new-tab" "<Primary><Shift>p")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-location-selector-buttons" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/redo" "<Primary><Shift>z")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-trash" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/open-in-new-window" "<Primary><Shift>o")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-statusbar" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/open-location" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/duplicate" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/trash-delete-2" "KP_Delete")
+; (gtk_accel_path "<Actions>/ThunarStandardView/back-alt1" "BackSpace")
+; (gtk_accel_path "<Actions>/ThunarStandardView/create-folder" "<Primary><Shift>n")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-home" "<Alt>Home")
+; (gtk_accel_path "<Actions>/ThunarWindow/switch-focused-split-view-pane" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/show-hidden" "<Primary>h")
+; (gtk_accel_path "<Actions>/ThunarStandardView/set-default-app" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/empty-trash" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/preferences" "")
+; (gtk_accel_path "<Actions>/ThunarActionManager/delete" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-network" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/view-side-pane-tree" "<Primary>e")
+; (gtk_accel_path "<Actions>/ThunarWindow/open-file-system" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/search-alt" "Search")
+; (gtk_accel_path "<Actions>/ThunarWindow/switch-next-tab-alt" "<Primary>Tab")
+; (gtk_accel_path "<Actions>/ThunarActionManager/sendto-desktop" "")
+; (gtk_accel_path "<Actions>/ThunarStandardView/make-link" "")
+; (gtk_accel_path "<Actions>/ThunarWindow/zoom-reset-alt" "<Primary>KP_0")
+; (gtk_accel_path "<Actions>/ThunarWindow/about" "")
+--- ./dotfiles/Thunar/uca.xml ---
+<?xml version="1.0" encoding="UTF-8"?>
+<actions>
+<action>
+	<icon>clipboard</icon>
+	<name>Copy File / Folder Path</name>
+	<submenu></submenu>
+	<unique-id>1653335357081852-1</unique-id>
+	<command>echo -n &apos;&quot;%f&quot;&apos; | wl-copy</command>
+	<description></description>
+	<range></range>
+	<patterns>*</patterns>
+	<directories/>
+	<audio-files/>
+	<image-files/>
+	<other-files/>
+	<text-files/>
+	<video-files/>
+</action>
+<action>
+	<icon>foot</icon>
+	<name>Edit in Terminal</name>
+	<submenu></submenu>
+	<unique-id>1715762765914315-1</unique-id>
+	<command>foot nvim %f</command>
+	<description></description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<other-files/>
+	<text-files/>
+</action>
+<action>
+	<icon>folder-blue-script</icon>
+	<name>Launch Terminal here</name>
+	<submenu></submenu>
+	<unique-id>1715763119333224-2</unique-id>
+	<command>foot -D %f</command>
+	<description></description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<directories/>
+</action>
+<action>
+	<icon>utilities-terminal_su</icon>
+	<name>Edit as root</name>
+	<submenu></submenu>
+	<unique-id>1716201472079277-1</unique-id>
+	<command>foot sudoedit %f</command>
+	<description></description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<other-files/>
+	<text-files/>
+</action>
+</actions>
+--- ./dotfiles/Thunar/uca.xml.bak ---
+<?xml version="1.0" encoding="UTF-8"?>
+<actions>
+<action>
+	<icon>utilities-terminal</icon>
+	<name>Open Terminal Here</name>
+	<submenu></submenu>
+	<unique-id>1764494029718074-1</unique-id>
+	<command>exo-open --working-directory %f --launch TerminalEmulator</command>
+	<description>Example for a custom action</description>
+	<range></range>
+	<patterns>*</patterns>
+	<startup-notify/>
+	<directories/>
+</action>
+</actions>
+--- ./dotfiles/starship.toml ---
+# Port of Oh My Zsh theme "avit" to Starship.
+# ======
+# 
+# Supports: Java, Node.JS, PHP, Go, Crystal, Python, Ruby, and Rust modules
+# Other modules include: Directory, and Git Branch/Commit/State/Status
+
+add_newline = false
+format = """\
+  $crystal$golang$java$nodejs$php$python$rust\
+  $directory\
+  $git_branch$git_commit$git_state$git_status\
+  $character\
+"""
+
+[character]
+success_symbol = "[ ➤]($bold fg:#f8f8f2)"
+error_symbol = "[ ➤]($bold fg:#fb4934)"
+
+[directory]
+disabled = false
+format = "[ $path](bold fg:#ff79c6)"
+truncate_to_repo = false
+
+[git_status]
+format = " ([$all_status$ahead_behind](bold fg:#8be9fd))"
+staged = "• "
+modified = "~ "
+untracked = "+ "
+deleted = "x "
+
+[git_branch]
+format = " [ $branch](bold fg:#8be9fd)"
+
+# Language Support
+[crystal]
+format = "🔮 "
+
+[golang]
+format = "🐭 "
+
+[java]
+format = "🍵 "
+
+[nodejs]
+format = "🍏 "
+detect_folders = [""]
+
+[php]
+format = "🐘 "
+
+[python]
+format = '🐍 [${pyenv_prefix}(${version})(\($virtualenv\))](bold fg:yellow)'
+
+[rust]
+format = "🦀 "
+--- ./dotfiles.json ---
+[{
+  "source": "./dotfiles/",
+  "target": "$HOME/.config/",
+  "pre_copy": [],
+  "post_copy": []
+}]--- ./installer.py ---
+import logging
+import os
+import sys
+import json
+import subprocess
+import threading
+
+class LogFormatter(logging.Formatter):
+    RESET = '\033[0m'
+    COLORS = {
+        'DEBUG': '\033[1;34m',    # Bold blue
+        'INFO': '\033[1;32m',     # Bold green
+        'WARNING': '\033[1;33m',  # Bold yellow
+        'ERROR': '\033[1;31m',    # Bold red
+        'CRITICAL': '\033[1;35m'  # Bold magenta
+    }
+    def __init__(self, fmt='%(levelname)-8s %(name)s: %(message)s', use_color=None):
+        super().__init__(fmt)
+        self.use_color = (not os.getenv('NO_COLOR')) and (use_color if use_color is not None else sys.stderr.isatty())
+    def format(self, record):
+        msg = super().format(record)
+        if not self.use_color:
+            return msg
+        return f"{self.COLORS.get(record.levelname,'')}{msg}{self.RESET}"
+
+logger = logging.getLogger("installer")
+logger.setLevel(logging.DEBUG)
+h = logging.StreamHandler()
+h.setLevel(logging.DEBUG)
+h.setFormatter(LogFormatter(use_color=sys.stderr.isatty()))
+logger.addHandler(h)
+
+def run(cmd, shell=True):
+    """
+    Runs a command in a subprocess with real-time output and interactive input.
+    Returns the subprocess return code.
+    """
+    
+    logger.info(f"Running command: {cmd}")
+
+    # Start the subprocess
+    process = subprocess.Popen(
+        cmd,
+        shell=shell,
+        stdin=sys.stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    # Function to read output line by line
+    def stream_output(pipe):
+        for line in iter(pipe.readline, ''):
+            print(line, end='')  # already has newline
+        pipe.close()
+
+    # Start a thread to stream stdout
+    t = threading.Thread(target=stream_output, args=(process.stdout,))
+    t.start()
+
+    # Wait for process to finish
+    process.wait()
+    t.join()
+
+    logger.info(f"Command exited with code {process.returncode}")
+    return process.returncode
+current_user = subprocess.check_output(["id", "-u", "-n"], text=True).strip()
+logger.info(f"Running as user: {current_user}")
+
+if os.geteuid() == 0:
+    logger.error("Please make a new user and run this script as that user, not as root.")
+    sys.exit(1)
+
+run("""sudo pacman -Syu --noconfirm""")
+run("""sudo pacman -S --needed git base-devel jq --noconfirm""")
+
+# Chaotic AUR
+run("""sudo pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com""")
+run("""sudo pacman-key --lsign-key 3056513887B78AEB""")
+run("""sudo pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' --noconfirm""")
+run("""sudo pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' --noconfirm""")
+run(r"""sudo sh -c 'grep -q "\[chaotic-aur\]" /etc/pacman.conf || echo -e "\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist" >> /etc/pacman.conf'""")
+run("""sudo pacman -Syu --noconfirm""")
+
+# Install yay
+run(f"""bash <<'EOF'
+cd /tmp
+git clone https://aur.archlinux.org/yay.git
+cd yay
+makepkg -si --noconfirm
+rm -rf /tmp/yay
+EOF""")
+
+# Main packages
+packages = ""
+# Hyprland
+packages += "hyprland polkit-kde-agent xdg-desktop-portal-hyprland "
+# Hypr utils
+packages += "hyprpicker hyprlock hypridle wlogout "
+# Clipboard
+packages += "wl-clipboard cliphist "
+# Bar
+packages += "waybar "
+# Application launcher
+packages += "tofi "
+# Themes / appearance
+packages += "nwg-look kvantum kvantum-theme-catppuccin-git swww python-pywal "
+# Clipboard
+packages += "cliphist wl-clipboard "
+# Screenshot
+packages += "flameshot "
+# Notifications daemon
+packages += "dunst "
+# QT Support
+packages += "qt5-wayland qt6-wayland qt5ct qt6ct "
+# Power
+packages += "upower "
+# Brightness management
+packages += "brightnessctl "
+# Audio
+packages += "pipewire wireplumber pamixer "
+# Network
+packages += "networkmanager  "
+# Bluetooth
+packages += "bluez bluez-utils blueman "
+# Utilities
+packages += "fastfetch git stow nano tar "
+# Fonts
+packages += "ttf-cascadia-code-nerd ttf-cascadia-mono-nerd ttf-fira-code ttf-fira-mono ttf-fira-sans ttf-firacode-nerd ttf-iosevka-nerd ttf-iosevkaterm-nerd ttf-jetbrains-mono-nerd ttf-jetbrains-mono ttf-nerd-fonts-symbols ttf-nerd-fonts-symbols ttf-nerd-fonts-symbols-mono "
+# Terminal
+packages += "kitty fish "
+# Greeter
+packages += "ly "
+
+# Install all packages at once
+run(f"yay -S --noconfirm --needed {packages}")
+
+logger.info("Loading dotfiles...")
+
+# Load JSON
+with open('dotfiles.json', 'r') as file:
+    dotfiles_data = json.load(file)
+
+# Iterate through each entry
+for dotfile in dotfiles_data:
+    source = dotfile.get("source")
+    target = dotfile.get("target")
+    pre_copy = dotfile.get("pre_copy", [])
+    post_copy = dotfile.get("post_copy", [])
+
+    logger.info(f"Source: {source}")
+    logger.info(f"Target: {target}")
+    logger.info(f"Pre-copy commands: {pre_copy}")
+    logger.info(f"Post-copy commands: {post_copy}")
+    logger.info("----------")
+
+    if pre_copy:
+        for cmd in pre_copy:
+            r = run(cmd)
+            if r != 0:
+                logger.error(f"Pre-copy command failed: {pre_copy}")
+
+    r = run(f"sudo cp -rfT \"{source}\" \"{target}\"")
+    if r != 0:
+        logger.error(f"Failed to copy {source} to {target}")
+
+    if post_copy:
+        for cmd in post_copy:
+            r = run(cmd)
+            if r != 0:
+                logger.error(f"Post-copy command failed: {post_copy}")
+
+# Copy assets
+logger.info("Installing assets...")
+run("cp -r ./assets/backgrounds $HOME/.config/assets/")
+run("cp -r ./assets/wlogout $HOME/.config/assets/")
+
+# Enable ly
+run("sudo systemctl enable ly.service")
+
+# Set ownership
+run(f"""sudo chown -R "{current_user}:{current_user}" /home/"{current_user}\"""")
+logger.info("""\nPost-installation instructions:
+Set themes and icons:
+   - Run 'nwg-look' and  set the global GTK and icon theme"
+   - Open 'kvantummanager' (run with sudo for system-wide changes) to select and apply the Catppuccin theme"
+   - Open 'qt6ct' to set the icon theme"
+
+------------------------------------------------------------------------""")
+logger.info("Installation complete! Please reboot your system.")
